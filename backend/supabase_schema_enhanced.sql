@@ -9,13 +9,17 @@ CREATE TABLE IF NOT EXISTS public.users (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Crop Listings
+-- Crop Listings (FIXED: Added variety, quantity, unit, location)
 CREATE TABLE IF NOT EXISTS public.crop_listings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     farmer_id UUID REFERENCES public.users(id),
     crop_name TEXT NOT NULL,
-    description TEXT,
+    variety TEXT,
+    quantity DECIMAL(10, 2) NOT NULL,
+    unit VARCHAR(20) DEFAULT 'quintal',
     base_price DECIMAL(10, 2) NOT NULL,
+    location TEXT NOT NULL,
+    description TEXT,
     status VARCHAR(50) DEFAULT 'active',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -28,12 +32,14 @@ CREATE TABLE IF NOT EXISTS public.crop_pictures (
     uploaded_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Bids
+-- Bids (FIXED: Added quantity and message)
 CREATE TABLE IF NOT EXISTS public.bids (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     listing_id UUID REFERENCES public.crop_listings(id),
     trader_id UUID REFERENCES public.users(id),
     amount DECIMAL(10, 2) NOT NULL,
+    quantity DECIMAL(10, 2) NOT NULL,
+    message TEXT,
     status VARCHAR(50) DEFAULT 'pending',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );

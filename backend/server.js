@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const { createClient } = require('@supabase/supabase-js');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const multer = require('multer');
 const csv = require('csv-parser');
 const fs = require('fs');
@@ -15,9 +16,20 @@ app.use(express.json());
 
 // Initialize Supabase Client
 const supabase = createClient(
-  process.env.SUPABASE_URL,
+  process.env.SUPABASE_URL.trim(),
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
 );
+
+// Initialize S3 Client for Supabase Storage uploads
+const s3Client = new S3Client({
+  forcePathStyle: true,
+  region: 'ap-south-1', // Required by AWS SDK, but Supabase ignores actual routing
+  endpoint: `${process.env.SUPABASE_URL.trim()}/storage/v1/s3`,
+  credentials: {
+    accessKeyId: process.env.SUPABASE_S3_ACCESS_KEY_ID?.trim(),
+    secretAccessKey: process.env.SUPABASE_S3_SECRET_ACCESS_KEY?.trim(),
+  }
+});
 
 // Configure Multer for temp file uploads
 const upload = multer({ dest: 'uploads/' });
@@ -89,12 +101,19 @@ app.post('/api/farmer/upload', upload.array('images', 5), async (req, res) => {
         const filePath = `${farmer_id}/${fileName}`;
         const fileBuffer = fs.readFileSync(file.path);
 
-        // Upload to Supabase Storage bucket 'crop_pictures'
-        const { error: uploadError } = await supabase.storage
-          .from('crop_pictures')
-          .upload(filePath, fileBuffer, { contentType: file.mimetype });
+        // Upload to Supabase Storage bucket 'crop_pictures' via S3 Compatible API
+        const uploadParams = {
+          Bucket: 'crop_pictures',
+          Key: filePath,
+          Body: fileBuffer,
+          ContentType: file.mimetype,
+        };
 
-        if (uploadError) throw uploadError;
+        try {
+          await s3Client.send(new PutObjectCommand(uploadParams));
+        } catch (uploadError) {
+          throw uploadError;
+        }
 
         // Get public URL
         const { data: publicUrlData } = supabase.storage
@@ -102,9 +121,9 @@ app.post('/api/farmer/upload', upload.array('images', 5), async (req, res) => {
           .getPublicUrl(filePath);
 
         // Save URL mapping in database
-        await supabase.from('crop_pictures').insert([{ 
-          listing_id: listingData.id, 
-          image_url: publicUrlData.publicUrl 
+        await supabase.from('crop_pictures').insert([{
+          listing_id: listingData.id,
+          image_url: publicUrlData.publicUrl
         }]);
 
         // Clean up temp file
@@ -214,7 +233,7 @@ app.put('/api/admin/dispute/:id/resolve', async (req, res) => {
     .select();
 
   if (error) return res.status(400).json({ error: error.message });
-  
+
   // Log Action
   await supabase.from('admin_logs').insert([{
     admin_id, action: 'Resolved Dispute', target_table: 'disputes', target_id: req.params.id

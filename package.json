@@ -9,7 +9,9 @@
     "csv-parser": "^3.2.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
-    "multer": "^2.0.2"
+    "express-ws": "^5.0.2",
+    "multer": "^2.0.2",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

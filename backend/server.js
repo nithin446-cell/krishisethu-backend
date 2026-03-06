@@ -51,6 +51,47 @@ if (!fs.existsSync('uploads')) {
 }
 
 // ==========================================
+// AUTH MIDDLEWARE
+// ==========================================
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Missing or invalid authorization token' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data.user) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Invalid token' });
+    }
+    req.user = data.user;
+    next();
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Failed to authenticate token' });
+  }
+};
+
+// ==========================================
+// USER ENDPOINTS
+// ==========================================
+app.get('/api/user/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
 // TRADER FEED (MARKET) ENDPOINTS - MISSING CODE ADDED
 // ==========================================
 
@@ -80,7 +121,7 @@ app.get('/api/market', async (req, res) => {
 // ==========================================
 
 // MISSING CODE ADDED: Handle FormData with multiple images AND text in one request (Option A)
-app.post('/api/farmer/upload', upload.array('images', 5), async (req, res) => {
+app.post('/api/farmer/upload', authenticateToken, upload.array('images', 5), async (req, res) => {
   try {
     // 1. Extract text fields from the FormData
     const { farmer_id, crop_name, variety, quantity, unit, base_price, location, description, status } = req.body;
@@ -90,11 +131,10 @@ app.post('/api/farmer/upload', upload.array('images', 5), async (req, res) => {
       .from('crop_listings')
       .insert([{
         farmer_id,
-        crop_name,
-        variety,
+        variety: variety || crop_name,  // Our schema uses 'variety' as the main name field
         quantity: parseFloat(quantity),
         unit,
-        base_price: parseFloat(base_price),
+        current_price: parseFloat(base_price),  // Our schema uses 'current_price'
         location,
         description,
         status: status || 'active'
@@ -155,8 +195,83 @@ app.post('/api/farmer/upload', upload.array('images', 5), async (req, res) => {
   }
 });
 
+// 1.5 Create a string JSON listing without files (Simple flow)
+app.post('/api/farmer/listings', authenticateToken, async (req, res) => {
+  try {
+    const { crop_type, quantity, unit, price_min, price_max, description, location, status } = req.body;
+    const farmer_id = req.body.farmer_id || req.user.id;
+
+    // Fallbacks for schema differences
+    const crop_name = crop_type || req.body.crop_name;
+    const base_price = price_min || req.body.base_price;
+    const variety = req.body.variety || '';
+
+    const { data, error } = await supabase
+      .from('crop_listings')
+      .insert([{
+        farmer_id,
+        variety: variety || crop_name,  // Our schema uses 'variety' as the main name field
+        quantity: parseFloat(quantity),
+        unit,
+        current_price: parseFloat(base_price),  // Our schema uses 'current_price'
+        location,
+        description,
+        status: status || 'active'
+      }])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 1.6 View active farmer listings
+app.get('/api/farmer/listings', authenticateToken, async (req, res) => {
+  try {
+    const farmer_id = req.query.farmer_id || req.user.id;
+    if (!farmer_id) return res.status(400).json({ success: false, error: 'farmer_id required' });
+
+    const { data, error } = await supabase
+      .from('crop_listings')
+      .select('*')
+      .eq('farmer_id', farmer_id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 1.7 View active farmer orders (accepted bids)
+app.get('/api/farmer/orders', authenticateToken, async (req, res) => {
+  try {
+    const farmer_id = req.query.farmer_id || req.user.id;
+    if (!farmer_id) return res.status(400).json({ success: false, error: 'farmer_id required' });
+
+    const { data, error } = await supabase
+      .from('orders')
+      .select(`
+        *,
+        crop_listings (variety, unit),
+        trader:users!trader_id (business_name, full_name, phone, location)
+      `)
+      .eq('farmer_id', farmer_id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // 2. View all bids for a farmer's listings
-app.get('/api/farmer/bids', async (req, res) => {
+app.get('/api/farmer/bids', authenticateToken, async (req, res) => {
   try {
     const { farmer_id } = req.query; // Expect farmer_id as a query parameter
     if (!farmer_id) {
@@ -167,7 +282,7 @@ app.get('/api/farmer/bids', async (req, res) => {
       .from('bids')
       .select(`
         *,
-        crop_listings!inner(farmer_id, crop_name, variety, base_price, quantity),
+        crop_listings!inner(farmer_id, variety, current_price, quantity),
         users!bids_trader_id_fkey(id, full_name, phone)
       `)
       .eq('crop_listings.farmer_id', farmer_id)
@@ -181,7 +296,7 @@ app.get('/api/farmer/bids', async (req, res) => {
 });
 
 // 3. Accept a Bid (Farmer Action)
-app.put('/api/farmer/bid/:id/accept', async (req, res) => {
+app.put('/api/farmer/bid/:id/accept', authenticateToken, async (req, res) => {
   try {
     const bidId = req.params.id; // The winning bid
     const { listing_id } = req.body;
@@ -192,9 +307,9 @@ app.put('/api/farmer/bid/:id/accept', async (req, res) => {
       .select('*')
       .eq('id', bidId)
       .single();
-      
+
     if (bidFetchError) throw bidFetchError;
-    
+
     // Fetch the listing details for the farmer ID
     const { data: listingData, error: listingFetchError } = await supabase
       .from('crop_listings')
@@ -236,7 +351,7 @@ app.put('/api/farmer/bid/:id/accept', async (req, res) => {
         final_amount: bidData.amount,
         status: 'pending_payment'
       }]);
-      
+
     if (orderError) throw orderError;
 
     res.status(200).json({ message: 'Bid accepted successfully. Order created and crop marked as sold!' });
@@ -250,8 +365,10 @@ app.put('/api/farmer/bid/:id/accept', async (req, res) => {
 // ==========================================
 
 // 1. Place a Bid
-app.post('/api/trader/bid', async (req, res) => {
-  const { listing_id, trader_id, amount, quantity, message } = req.body;
+app.post('/api/trader/bid', authenticateToken, async (req, res) => {
+  const { listing_id, amount, quantity, message } = req.body;
+  const trader_id = req.user.id; // Securely get ID from token
+
   const { data, error } = await supabase
     .from('bids')
     .insert([{ listing_id, trader_id, amount, quantity, message }])
@@ -263,9 +380,9 @@ app.post('/api/trader/bid', async (req, res) => {
 });
 
 // 2. View all bids placed by a trader
-app.get('/api/trader/bids', async (req, res) => {
+app.get('/api/trader/bids', authenticateToken, async (req, res) => {
   try {
-    const { trader_id } = req.query; // Expect trader_id as a query parameter
+    const trader_id = req.query.trader_id || req.user.id; // Default to authenticated user
     if (!trader_id) {
       return res.status(400).json({ error: 'trader_id is required' });
     }
@@ -274,7 +391,7 @@ app.get('/api/trader/bids', async (req, res) => {
       .from('bids')
       .select(`
         *,
-        crop_listings (crop_name, variety, base_price, status)
+        crop_listings (variety, current_price, status)
       `)
       .eq('trader_id', trader_id)
       .order('created_at', { ascending: false });
@@ -287,8 +404,10 @@ app.get('/api/trader/bids', async (req, res) => {
 });
 
 // 2. Raise a Dispute
-app.post('/api/trader/dispute', async (req, res) => {
-  const { bid_id, trader_id, reason } = req.body;
+app.post('/api/trader/dispute', authenticateToken, async (req, res) => {
+  const { bid_id, reason } = req.body;
+  const trader_id = req.user.id; // Securely get ID from token
+
   const { data, error } = await supabase
     .from('disputes')
     .insert([{ bid_id, trader_id, reason }])
@@ -304,13 +423,13 @@ app.post('/api/trader/dispute', async (req, res) => {
 // ==========================================
 
 // 1. Get All Orders (Completed Trades)
-app.get('/api/admin/orders', async (req, res) => {
+app.get('/api/admin/orders', authenticateToken, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('orders')
       .select(`
         *,
-        crop_listings (crop_name, variety, quantity, unit),
+        crop_listings (variety, quantity, unit),
         farmer:users!farmer_id (full_name, phone),
         trader:users!trader_id (full_name, phone)
       `)
@@ -324,13 +443,13 @@ app.get('/api/admin/orders', async (req, res) => {
 });
 
 // 2. Get All Bids (Market Activity)
-app.get('/api/admin/bids', async (req, res) => {
+app.get('/api/admin/bids', authenticateToken, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('bids')
       .select(`
         *,
-        crop_listings (crop_name, variety),
+        crop_listings (variety),
         users!bids_trader_id_fkey (full_name)
       `)
       .order('created_at', { ascending: false });
@@ -343,7 +462,7 @@ app.get('/api/admin/bids', async (req, res) => {
 });
 
 // 3. Get All Open Disputes
-app.get('/api/admin/disputes', async (req, res) => {
+app.get('/api/admin/disputes', authenticateToken, async (req, res) => {
   const { data, error } = await supabase
     .from('disputes')
     .select(`*, bids(amount, crop_listings(crop_name))`)
@@ -355,8 +474,10 @@ app.get('/api/admin/disputes', async (req, res) => {
 });
 
 // 2. Resolve Dispute
-app.put('/api/admin/dispute/:id/resolve', async (req, res) => {
-  const { resolution_notes, admin_id } = req.body;
+app.put('/api/admin/dispute/:id/resolve', authenticateToken, async (req, res) => {
+  const { resolution_notes } = req.body;
+  const admin_id = req.user.id; // Securely get admin ID from token
+
   const { data, error } = await supabase
     .from('disputes')
     .update({ status: 'resolved', resolution_notes, updated_at: new Date() })

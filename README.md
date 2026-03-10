@@ -7,6 +7,7 @@ Backend API for the Krishisethu platform.
 ```bash
 npm install
 npm start
+npm install razorpay crypto
 ```
 
 ## Database

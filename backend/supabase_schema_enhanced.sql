@@ -78,3 +78,8 @@ CREATE TABLE IF NOT EXISTS public.admin_logs (
 
 -- Enable Realtime for the Admin Portal
 ALTER PUBLICATION supabase_realtime ADD TABLE disputes;
+-- Add missing columns for complete user profiles
+ALTER TABLE public.users 
+ADD COLUMN IF NOT EXISTS phone VARCHAR(20),
+ADD COLUMN IF NOT EXISTS location TEXT,
+ADD COLUMN IF NOT EXISTS business_name TEXT;

@@ -97,6 +97,28 @@ app.get('/api/user/:id', async (req, res) => {
   }
 });
 
+app.post('/api/auth/signup', async (req, res) => {
+  const { email, password, full_name, role, phone, location, business_name } = req.body;
+  try {
+    // 🛑 SECURITY LOCKDOWN: Block fake admin signups
+    if (role === 'admin') {
+      return res.status(403).json({ success: false, error: 'Unauthorized: Cannot create admin accounts via public signup.' });
+    }
+
+    const { data: authData, error: authError } = await supabase.auth.signUp({ email, password });
+    if (authError) throw authError;
+
+    const { data: userData, error: userError } = await supabase.from('users').insert([{
+      id: authData.user.id, role, full_name, phone, location, business_name
+    }]).select().single();
+    if (userError) throw userError;
+
+    res.status(201).json({ success: true, message: 'Account created', user: userData, session: authData.session });
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
 // ==========================================
 // MARKET FEED
 // ==========================================
@@ -156,7 +178,6 @@ app.get('/api/farmer/orders', authenticateToken, async (req, res) => {
   }
 });
 
-// RLS Bypass to confirm payment
 app.put('/api/farmer/order/:id/confirm-payment', authenticateToken, async (req, res) => {
   try {
     const { payment_status } = req.body;
@@ -258,6 +279,133 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
     if (error) throw error;
     res.status(201).json(data);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// ADMIN PORTAL ENDPOINTS
+// ==========================================
+app.get('/api/admin/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select(`
+        *,
+        crop_listings (variety, quantity, unit),
+        farmer:users!farmer_id (full_name, phone),
+        trader:users!trader_id (full_name, phone)
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json(orders);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/admin/order/:id/resolve', authenticateToken, async (req, res) => {
+  try {
+    const { action } = req.body; 
+    let newStatus = action === 'refund_trader' ? 'cancelled' : 'completed';
+    let paymentStatus = action === 'refund_trader' ? 'refunded' : 'paid';
+
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ status: newStatus, payment_status: paymentStatus, updated_at: new Date() })
+      .eq('id', req.params.id)
+      .select();
+
+    if (error) throw error;
+    res.status(200).json({ success: true, message: 'Dispute resolved successfully', data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Fetch all users waiting for verification
+app.get('/api/admin/verifications', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, full_name, role, phone, location, business_name, verification_status, document_type, document_url, created_at')
+      .eq('verification_status', 'pending_verification')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Approve or Reject a user's verification
+app.put('/api/admin/verify/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { status } = req.body; // 'verified' or 'rejected'
+    
+    const { data, error } = await supabase
+      .from('users')
+      .update({ verification_status: status })
+      .eq('id', req.params.userId)
+      .select();
+
+    if (error) throw error;
+    res.status(200).json({ success: true, message: `User marked as ${status}`, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// USER KYC (VERIFICATION) UPLOAD (MULTIPLE FILES)
+// ==========================================
+app.post('/api/user/kyc', authenticateToken, upload.array('documents', 5), async (req, res) => {
+  try {
+    const { document_type } = req.body;
+    const userId = req.user.id;
+
+    if (!req.files || req.files.length === 0) {
+      throw new Error('No document images uploaded');
+    }
+
+    const uploadedUrls = [];
+
+    // 1. Upload ALL images to S3
+    for (const file of req.files) {
+      const fileExt = path.extname(file.originalname);
+      const fileName = `${userId}-${Date.now()}-${Math.round(Math.random() * 1000)}${fileExt}`;
+      
+      await s3Client.send(new PutObjectCommand({
+        Bucket: 'user_documents',
+        Key: fileName,
+        Body: fs.readFileSync(file.path),
+        ContentType: file.mimetype
+      }));
+
+      const { data: publicUrlData } = supabase.storage.from('user_documents').getPublicUrl(fileName);
+      uploadedUrls.push(publicUrlData.publicUrl);
+      
+      // Clean up local temp file
+      fs.unlinkSync(file.path);
+    }
+
+    // 2. Update the user's profile with comma-separated URLs
+    const { data, error } = await supabase.from('users').update({
+      verification_status: 'pending_verification',
+      document_type: document_type,
+      document_url: uploadedUrls.join(','), // Store multiple URLs securely
+      updated_at: new Date()
+    }).eq('id', userId).select();
+
+    if (error) throw error;
+
+    res.status(200).json({ success: true, message: 'KYC Documents submitted successfully!', data });
+  } catch (error) {
+    if (req.files) {
+      req.files.forEach(file => { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); });
+    }
     res.status(500).json({ error: error.message });
   }
 });

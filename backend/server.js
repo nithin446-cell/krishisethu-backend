@@ -13,7 +13,10 @@ dotenv.config({ path: __dirname + '/.env' });
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+
+// 🚀 Increased payload limits for large CSV files
+app.use(express.json({ limit: '500mb' }));
+app.use(express.urlencoded({ limit: '500mb', extended: true }));
 
 // Initialize Supabase Client
 const supabaseUrl = process.env.SUPABASE_URL?.trim();
@@ -70,23 +73,6 @@ const authenticateToken = async (req, res, next) => {
 // ==========================================
 // AUTH & USERS
 // ==========================================
-app.post('/api/auth/signup', async (req, res) => {
-  const { email, password, full_name, role, phone, location, business_name } = req.body;
-  try {
-    const { data: authData, error: authError } = await supabase.auth.signUp({ email, password });
-    if (authError) throw authError;
-
-    const { data: userData, error: userError } = await supabase.from('users').insert([{
-      id: authData.user.id, role, full_name, phone, location, business_name
-    }]).select().single();
-    if (userError) throw userError;
-
-    res.status(201).json({ success: true, message: 'Account created', user: userData, session: authData.session });
-  } catch (error) {
-    res.status(400).json({ success: false, error: error.message });
-  }
-});
-
 app.get('/api/user/:id', async (req, res) => {
   try {
     const { data, error } = await supabase.from('users').select('*').eq('id', req.params.id).single();
@@ -127,6 +113,16 @@ app.get('/api/market', authenticateToken, async (req, res) => {
     const { data, error } = await req.userSupabase.from('crop_listings').select(`*, users ( full_name, location, business_name ), crop_pictures ( image_url ), bids ( * )`).eq('status', 'active').order('created_at', { ascending: false });
     if (error) throw error;
     res.status(200).json(data.map(item => ({ ...item, images: item.crop_pictures?.map(pic => pic.image_url) || [] })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/market-prices', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('market_prices').select('*').order('price_date', { ascending: false }).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.status(200).json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -288,16 +284,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 // ==========================================
 app.get('/api/admin/dashboard', authenticateToken, async (req, res) => {
   try {
-    const { data: orders, error } = await supabase
-      .from('orders')
-      .select(`
-        *,
-        crop_listings (variety, quantity, unit),
-        farmer:users!farmer_id (full_name, phone),
-        trader:users!trader_id (full_name, phone)
-      `)
-      .order('created_at', { ascending: false });
-
+    const { data: orders, error } = await supabase.from('orders').select(`*, crop_listings (variety, quantity, unit), farmer:users!farmer_id (full_name, phone), trader:users!trader_id (full_name, phone)`).order('created_at', { ascending: false });
     if (error) throw error;
     res.status(200).json(orders);
   } catch (error) {
@@ -311,12 +298,7 @@ app.put('/api/admin/order/:id/resolve', authenticateToken, async (req, res) => {
     let newStatus = action === 'refund_trader' ? 'cancelled' : 'completed';
     let paymentStatus = action === 'refund_trader' ? 'refunded' : 'paid';
 
-    const { data, error } = await supabase
-      .from('orders')
-      .update({ status: newStatus, payment_status: paymentStatus, updated_at: new Date() })
-      .eq('id', req.params.id)
-      .select();
-
+    const { data, error } = await supabase.from('orders').update({ status: newStatus, payment_status: paymentStatus, updated_at: new Date() }).eq('id', req.params.id).select();
     if (error) throw error;
     res.status(200).json({ success: true, message: 'Dispute resolved successfully', data });
   } catch (error) {
@@ -324,15 +306,9 @@ app.put('/api/admin/order/:id/resolve', authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch all users waiting for verification
 app.get('/api/admin/verifications', authenticateToken, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('users')
-      .select('id, full_name, role, phone, location, business_name, verification_status, document_type, document_url, created_at')
-      .eq('verification_status', 'pending_verification')
-      .order('created_at', { ascending: false });
-
+    const { data, error } = await supabase.from('users').select('id, full_name, role, phone, location, business_name, verification_status, document_type, document_url, created_at').eq('verification_status', 'pending_verification').order('created_at', { ascending: false });
     if (error) throw error;
     res.status(200).json(data);
   } catch (error) {
@@ -340,17 +316,10 @@ app.get('/api/admin/verifications', authenticateToken, async (req, res) => {
   }
 });
 
-// Approve or Reject a user's verification
 app.put('/api/admin/verify/:userId', authenticateToken, async (req, res) => {
   try {
-    const { status } = req.body; // 'verified' or 'rejected'
-    
-    const { data, error } = await supabase
-      .from('users')
-      .update({ verification_status: status })
-      .eq('id', req.params.userId)
-      .select();
-
+    const { status } = req.body;
+    const { data, error } = await supabase.from('users').update({ verification_status: status }).eq('id', req.params.userId).select();
     if (error) throw error;
     res.status(200).json({ success: true, message: `User marked as ${status}`, data });
   } catch (error) {
@@ -358,56 +327,156 @@ app.put('/api/admin/verify/:userId', authenticateToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// USER KYC (VERIFICATION) UPLOAD (MULTIPLE FILES)
-// ==========================================
 app.post('/api/user/kyc', authenticateToken, upload.array('documents', 5), async (req, res) => {
   try {
     const { document_type } = req.body;
     const userId = req.user.id;
 
-    if (!req.files || req.files.length === 0) {
-      throw new Error('No document images uploaded');
-    }
+    if (!req.files || req.files.length === 0) throw new Error('No document images uploaded');
 
     const uploadedUrls = [];
-
-    // 1. Upload ALL images to S3
     for (const file of req.files) {
       const fileExt = path.extname(file.originalname);
       const fileName = `${userId}-${Date.now()}-${Math.round(Math.random() * 1000)}${fileExt}`;
-      
-      await s3Client.send(new PutObjectCommand({
-        Bucket: 'user_documents',
-        Key: fileName,
-        Body: fs.readFileSync(file.path),
-        ContentType: file.mimetype
-      }));
-
+      await s3Client.send(new PutObjectCommand({ Bucket: 'user_documents', Key: fileName, Body: fs.readFileSync(file.path), ContentType: file.mimetype }));
       const { data: publicUrlData } = supabase.storage.from('user_documents').getPublicUrl(fileName);
       uploadedUrls.push(publicUrlData.publicUrl);
-      
-      // Clean up local temp file
       fs.unlinkSync(file.path);
     }
 
-    // 2. Update the user's profile with comma-separated URLs
-    const { data, error } = await supabase.from('users').update({
-      verification_status: 'pending_verification',
-      document_type: document_type,
-      document_url: uploadedUrls.join(','), // Store multiple URLs securely
-      updated_at: new Date()
-    }).eq('id', userId).select();
-
+    const { data, error } = await supabase.from('users').update({ verification_status: 'pending_verification', document_type: document_type, document_url: uploadedUrls.join(','), updated_at: new Date() }).eq('id', userId).select();
     if (error) throw error;
-
     res.status(200).json({ success: true, message: 'KYC Documents submitted successfully!', data });
   } catch (error) {
-    if (req.files) {
-      req.files.forEach(file => { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); });
-    }
+    if (req.files) req.files.forEach(file => { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); });
     res.status(500).json({ error: error.message });
   }
+});
+
+// ==========================================
+// BULK PRICE UPLOAD (MUST BE HERE)
+// ==========================================
+const csv = require('csv-parser');
+
+app.post('/api/admin/prices/upload-csv', authenticateToken, upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: 'No CSV file uploaded.' });
+  }
+
+  const results = [];
+  const BATCH_SIZE = 5000;
+  let totalInserted = 0;
+  let hasError = false;
+
+  const stream = fs.createReadStream(req.file.path).pipe(csv());
+
+  stream.on('data', async (data) => {
+    // Basic validation & transformation
+    if (data['Crop Name'] || data.crop_name) {
+      results.push({
+        crop_name: data['Crop Name'] || data.crop_name,
+        variety: data['Variety'] || data.variety || 'Standard',
+        market_name: data['Market Name'] || data.market_name,
+        min_price: parseFloat(data['Min Price'] || data.min_price) || 0,
+        max_price: parseFloat(data['Max Price'] || data.max_price) || 0,
+        modal_price: parseFloat(data['Modal Price'] || data.modal_price) || 0,
+      });
+    }
+
+    // Process in batches
+    if (results.length >= BATCH_SIZE) {
+      stream.pause(); // Pause reading while we insert
+      const batchToInsert = [...results];
+      results.length = 0; // Clear array for next batch
+
+      try {
+        const { error } = await supabase.from('market_prices').insert(batchToInsert);
+        if (error) throw error;
+        totalInserted += batchToInsert.length;
+        stream.resume(); // Resume parsing after successful insert
+      } catch (err) {
+        hasError = true;
+        console.error('CSV Batch Insert Error:', err.message);
+        stream.destroy();
+        fs.unlinkSync(req.file.path); // Cleanup temp file
+        return res.status(500).json({ success: false, error: 'Database insertion failed: ' + err.message });
+      }
+    }
+  });
+
+  stream.on('end', async () => {
+    if (hasError) return; // Prevent double response if stream aborted
+
+    if (results.length > 0) {
+      try {
+        const { error } = await supabase.from('market_prices').insert(results);
+        if (error) throw error;
+        totalInserted += results.length;
+      } catch (err) {
+        console.error('CSV Final Batch Insert Error:', err.message);
+        fs.unlinkSync(req.file.path);
+        return res.status(500).json({ success: false, error: 'Database insertion failed: ' + err.message });
+      }
+    }
+
+    // Cleanup local temp file
+    fs.unlinkSync(req.file.path);
+    res.status(200).json({ success: true, message: `${totalInserted} prices stream-uploaded successfully!` });
+  });
+
+  stream.on('error', (err) => {
+    console.error('CSV Stream Read Error:', err.message);
+    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: 'Failed to read CSV file.' });
+    }
+  });
+});
+
+app.post('/api/admin/prices/bulk', authenticateToken, async (req, res) => {
+  try {
+    const { prices } = req.body;
+    if (!prices || !Array.isArray(prices) || prices.length === 0) throw new Error('No valid price data found.');
+    const { data, error } = await supabase.from('market_prices').insert(prices).select();
+    if (error) throw error;
+    res.status(200).json({ success: true, message: `${data.length} prices uploaded successfully!`, data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// CLEAR ALL MARKET PRICES (MUST BE HERE)
+// ==========================================
+app.delete('/api/admin/prices', authenticateToken, async (req, res) => {
+  try {
+    const { error } = await supabase.from('market_prices').delete().not('id', 'is', null); 
+    if (error) throw error;
+    res.status(200).json({ success: true, message: 'All market prices cleared successfully!' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// ERROR HANDLING MIDDLEWARE
+// ==========================================
+app.use((err, req, res, next) => {
+  // Catch invalid JSON syntax errors
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    console.error('Bad JSON Syntax:', err.message);
+    return res.status(400).json({ success: false, error: 'Invalid JSON payload format.' });
+  }
+  
+  // Catch payload too large errors (e.g., from express.json limit)
+  if (err.type === 'entity.too.large') {
+    console.error('Payload Too Large:', err.message);
+    return res.status(413).json({ success: false, error: 'Payload size exceeds the 500MB limit.' });
+  }
+  
+  // Generic fallback for other errors
+  console.error('Unhandled Server Error:', err);
+  res.status(err.status || 500).json({ success: false, error: err.message || 'Internal Server Error' });
 });
 
 const port = parseInt(process.env.PORT, 10) || 5000;

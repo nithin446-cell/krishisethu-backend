@@ -230,6 +230,20 @@ app.get('/api/trader/bids', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/trader/orders', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await req.userSupabase
+      .from('orders')
+      .select(`*, crop_listings (variety, unit, location), farmer:users!farmer_id (full_name, phone), bids (quantity)`)
+      .eq('trader_id', req.user.id)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ==========================================
 // PAYMENTS (RAZORPAY)
 // ==========================================

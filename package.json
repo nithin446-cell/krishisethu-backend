@@ -4,6 +4,7 @@
     "dev": "nodemon backend/server.js"
   },
   "dependencies": {
+    "@sentry/node": "^10.43.0",
     "@supabase/supabase-js": "^2.97.0",
     "cors": "^2.8.6",
     "crypto": "^1.0.1",
@@ -16,6 +17,8 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "jest": "^30.3.0",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.2.2"
   }
 }

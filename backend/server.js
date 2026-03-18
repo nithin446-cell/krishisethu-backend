@@ -9,10 +9,18 @@ const path = require('path');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 
-dotenv.config({ path: __dirname + '/.env' });
+// Load env based on NODE_ENV: .env.production in prod, .env.development in dev
+const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
+dotenv.config({ path: `${__dirname}/${envFile}` });
+// Fallback to plain .env if specific file doesn't exist
+dotenv.config({ path: `${__dirname}/.env` });
 
 const app = express();
 app.use(cors());
+
+// 🔌 Initialize express-ws for WebSocket support (chat rooms)
+const expressWs = require('express-ws')(app);
+const chatRooms = {}; // { order_id: Set<WebSocket> }
 
 // 🚀 Increased payload limits for large CSV files
 app.use(express.json({ limit: '500mb' }));
@@ -192,14 +200,13 @@ app.put('/api/farmer/order/:id/confirm-payment', authenticateToken, async (req, 
 app.put('/api/farmer/bid/:id/accept', authenticateToken, async (req, res) => {
   try {
     const { listing_id } = req.body;
-    const { data: bidData } = await req.userSupabase.from('bids').select('*').eq('id', req.params.id).single();
-    const { data: listingData } = await req.userSupabase.from('crop_listings').select('farmer_id').eq('id', listing_id).single();
-
-    await req.userSupabase.from('bids').update({ status: 'accepted' }).eq('id', req.params.id);
-    await req.userSupabase.from('bids').update({ status: 'rejected' }).eq('listing_id', listing_id).neq('id', req.params.id);
-    await req.userSupabase.from('crop_listings').update({ status: 'sold' }).eq('id', listing_id);
-
-    await req.userSupabase.from('orders').insert([{ listing_id, bid_id: req.params.id, farmer_id: listingData.farmer_id, trader_id: bidData.trader_id, final_amount: bidData.amount, status: 'pending_payment', payment_status: 'yet_to_paid' }]);
+    // ⚡ Atomic transaction via Supabase RPC — prevents race conditions
+    // All 4 operations (accept bid, reject others, mark sold, create order) run in one DB transaction
+    const { error } = await req.userSupabase.rpc('accept_bid', {
+      p_bid_id: req.params.id,
+      p_listing_id: listing_id
+    });
+    if (error) throw error;
     res.status(200).json({ message: 'Bid accepted successfully.' });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -265,6 +272,37 @@ app.post('/api/payment/verify', authenticateToken, async (req, res) => {
     await supabase.from('orders').update({ status: 'completed', payment_status: 'processing', razorpay_payment_id, updated_at: new Date() }).eq('id', order_id);
     res.status(200).json({ success: true, message: 'Payment verified!' });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 🔔 Razorpay Webhook — server-side payment confirmation fallback
+// Ensures payment_status updates even if user's browser closes mid-checkout
+app.post('/api/payment/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  try {
+    const signature = req.headers['x-razorpay-signature'];
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) return res.status(500).json({ error: 'Webhook secret not configured' });
+
+    const isValid = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(req.body.toString())
+      .digest('hex') === signature;
+
+    if (!isValid) return res.status(400).json({ error: 'Invalid webhook signature' });
+
+    const event = JSON.parse(req.body);
+    if (event.event === 'payment.captured') {
+      const orderId = event.payload.payment.entity.receipt;
+      // Use service role for webhook updates (no user context available)
+      supabase.from('orders')
+        .update({ payment_status: 'processing', status: 'completed', updated_at: new Date() })
+        .eq('id', orderId)
+        .then(({ error }) => { if (error) console.error('Webhook order update failed:', error); });
+    }
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Webhook error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -493,5 +531,49 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ success: false, error: err.message || 'Internal Server Error' });
 });
 
-const port = parseInt(process.env.PORT, 10) || 5000;
-app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+const port = parseInt(process.env.PORT, 10) || 10000;
+const server = app.listen(port, () => console.log(`🚀 Server running on port ${port} [${process.env.NODE_ENV || 'development'} mode]`));
+
+// 💬 WebSocket chat rooms — /ws?order_id=<id>&token=<jwt>
+// Broadcasts messages to all clients in the same order room
+app.ws('/ws', async (ws, req) => {
+  const { order_id, token } = req.query;
+
+  if (!order_id || !token) {
+    ws.close(1008, 'Missing order_id or token');
+    return;
+  }
+
+  // Validate the JWT token
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) {
+    ws.close(1008, 'Unauthorized');
+    return;
+  }
+
+  const userId = data.user.id;
+  console.log(`🔗 WS: User ${userId} joined room ${order_id}`);
+
+  // Add to room
+  if (!chatRooms[order_id]) chatRooms[order_id] = new Set();
+  chatRooms[order_id].add(ws);
+
+  ws.on('message', (msg) => {
+    // Broadcast to everyone else in the same room
+    chatRooms[order_id]?.forEach(client => {
+      if (client !== ws && client.readyState === 1) {
+        client.send(msg);
+      }
+    });
+  });
+
+  ws.on('close', () => {
+    chatRooms[order_id]?.delete(ws);
+    if (chatRooms[order_id]?.size === 0) delete chatRooms[order_id];
+    console.log(`🔌 WS: User ${userId} left room ${order_id}`);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`WS error for user ${userId} in room ${order_id}:`, err);
+  });
+});

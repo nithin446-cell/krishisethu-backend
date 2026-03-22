@@ -8,7 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
-
+const FormData = require('form-data');
+const axios = require('axios');
 // Load env based on NODE_ENV: .env.production in prod, .env.development in dev
 const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
 dotenv.config({ path: `${__dirname}/${envFile}` });
@@ -184,16 +185,79 @@ app.get('/api/farmer/orders', authenticateToken, async (req, res) => {
 
 app.put('/api/farmer/order/:id/confirm-payment', authenticateToken, async (req, res) => {
   try {
-    const { payment_status } = req.body;
-    let updateData = { payment_status, updated_at: new Date() };
-    if (payment_status === 'paid') updateData.farmer_confirmed_at = new Date();
-    else if (payment_status === 'not_paid') updateData.status = 'disputed';
+    const orderId = req.params.id;
+    const farmerId = req.user.id;
 
-    const { data, error } = await supabase.from('orders').update(updateData).eq('id', req.params.id).eq('farmer_id', req.user.id).select();
-    if (error) throw error;
-    res.status(200).json({ success: true, message: `Payment marked ${payment_status}`, data });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    // Fetch Razorpay helper
+    const razorpayFetch = async (path, method = 'GET', body = null) => {
+      const auth = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+      const res = await fetch(`https://api.razorpay.com/v1${path}`, {
+        method, headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${auth}` },
+        body: body ? JSON.stringify(body) : null,
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.description || 'Razorpay API error');
+      return data;
+    };
+
+    const { data: order } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', orderId)
+      .eq('farmer_id', farmerId)
+      .single();
+
+    if (!order) throw new Error('Order not found');
+    if (order.payment_status === 'paid') throw new Error('Already confirmed');
+
+    let payoutResult = null;
+
+    if (order.route_transfer_linked) {
+      // ── OPTION A: Release held Route transfer (Razorpay Route)
+      const transfers = await razorpayFetch(`/orders/${order.razorpay_order_id}/transfers`);
+      const transfer = transfers.items?.[0];
+
+      if (transfer && transfer.on_hold) {
+        payoutResult = await razorpayFetch(`/transfers/${transfer.id}`, 'PATCH', {
+          on_hold: 0, // Release funds!
+        });
+      }
+    } else if (order.farmer_fund_account_id) {
+      // ── OPTION B: Manual RazorpayX Payout
+      const totalPaise = Math.round(order.final_amount * 100);
+      const farmerAmountPaise = Math.round(totalPaise * 0.97); // minus 3%
+
+      payoutResult = await razorpayFetch('/payouts', 'POST', {
+        account_number: process.env.RAZORPAY_X_ACCOUNT_NUMBER,
+        fund_account_id: order.farmer_fund_account_id,
+        amount: farmerAmountPaise,
+        currency: 'INR',
+        mode: 'IMPS',
+        purpose: 'payout',
+        queue_if_low_balance: true,
+        reference_id: orderId,
+        narration: `KrishiSethu payment ${orderId.slice(0, 8)}`,
+      });
+    }
+
+    // Update order
+    await supabase.from('orders').update({
+      payment_status: 'paid',
+      payout_reference: payoutResult?.id || null, // Might be null if fallback Option C
+      farmer_confirmed_at: new Date(),
+      updated_at: new Date(),
+    }).eq('id', orderId);
+
+    res.json({
+      success: true,
+      message: payoutResult
+        ? 'Payment released to your bank account!'
+        : 'Confirmed. Payment will be processed within 24 hours.',
+      payout_id: payoutResult?.id || null,
+    });
+  } catch (err) {
+    console.error('Confirm payment error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -256,9 +320,66 @@ app.get('/api/trader/orders', authenticateToken, async (req, res) => {
 // ==========================================
 app.post('/api/payment/create', authenticateToken, async (req, res) => {
   try {
-    const order = await razorpay.orders.create({ amount: Math.round(req.body.amount * 100), currency: "INR", receipt: req.body.order_id });
-    res.status(200).json({ success: true, razorpay_order_id: order.id, amount: order.amount });
+    const { listing_id, Math: _m, amount: rawAmount, order_id: customReceipt, quantity = 1, agreed_price } = req.body;
+    const traderId = req.user.id;
+    
+    // We fall back to rawAmount if agreed_price and quantity aren't properly passed for cart flows
+    const effectivePrice = agreed_price || rawAmount;
+    const effectiveQty = quantity || 1;
+
+    // Get listing + farmer's linked account
+    const { data: listing } = await supabase
+      .from('crop_listings')
+      .select('*, users!farmer_id(id, full_name)')
+      .eq('id', listing_id)
+      .single();
+      
+    const { data: bankAccount } = await supabase
+      .from('bank_accounts')
+      .select('razorpay_linked_account_id, razorpay_fund_account_id, is_verified')
+      .eq('user_id', listing?.farmer_id)
+      .maybeSingle();
+
+    const totalPaise = Math.round(rawAmount * 100) || Math.round(effectivePrice * effectiveQty * 100);
+    const platformFeePaise = Math.round(totalPaise * 0.03); // 3% platform fee
+    const farmerAmountPaise = totalPaise - platformFeePaise;
+
+    const farmerLinkedAccId = bankAccount?.razorpay_linked_account_id;
+    const farmerFundAccId = bankAccount?.razorpay_fund_account_id;
+    const farmerBankVerified = bankAccount?.is_verified;
+
+    // Build Razorpay order — with Route transfer if farmer has verified account
+    const orderPayload = {
+      amount: totalPaise,
+      currency: 'INR',
+      receipt: customReceipt || `order_${Date.now()}`,
+      notes: { listing_id, trader_id: traderId, farmer_id: listing?.farmer_id },
+    };
+
+    // Add Route transfer if farmer's linked account exists
+    if (farmerLinkedAccId && farmerBankVerified) {
+      orderPayload.transfers = [{
+        account: farmerLinkedAccId,
+        amount: farmerAmountPaise,
+        currency: 'INR',
+        on_hold: 1, // Hold until farmer confirms delivery
+        on_hold_until: Math.floor((Date.now() + 7 * 24 * 60 * 60 * 1000) / 1000), // 7 days max
+        notes: { reason: 'Farmer payment for KrishiSethu order' },
+      }];
+    }
+
+    const razorpayOrder = await razorpay.orders.create(orderPayload);
+    res.status(200).json({ 
+      success: true, 
+      razorpay_order_id: razorpayOrder.id, 
+      amount: totalPaise,
+      farmer_bank_linked: !!farmerLinkedAccId,
+      platform_fee: platformFeePaise / 100,
+      farmer_receives: farmerAmountPaise / 100,
+      farmer_fund_account_id: farmerFundAccId || null
+    });
   } catch (error) {
+    console.error('Payment create error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -406,6 +527,53 @@ app.post('/api/user/kyc', authenticateToken, upload.array('documents', 5), async
 });
 
 // ==========================================
+// SUREPASS KYC INTEGRATION
+// ==========================================
+app.post('/api/user/kyc/surepass', authenticateToken, upload.single('document'), async (req, res) => {
+  try {
+    if (!req.file) throw new Error('No document uploaded.');
+
+    const formData = new FormData();
+    formData.append('file', fs.createReadStream(req.file.path));
+
+    // Call Surepass API (Replace the URL with specific Aadhaar/PAN endpoint if necessary)
+    // Note: sandbox URL is used below, swap to production URL for live deployments.
+    const surepassRes = await axios.post('https://sandbox.surepass.io/api/v1/ocr/aadhaar', formData, {
+      headers: {
+        'Authorization': `Bearer ${process.env.SUREPASS_TOKEN}`,
+        ...formData.getHeaders()
+      }
+    });
+
+    const surepassData = surepassRes.data;
+    
+    // Clean up local temp file
+    if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+
+    if (surepassData.status_code !== 200 || !surepassData.data) {
+       throw new Error(`Surepass Error: ${surepassData.message || 'Verification failed.'}`);
+    }
+
+    // Update user verification status securely utilizing the Service Role Key implicitly on the backend
+    const { error } = await supabase
+      .from('users')
+      .update({
+        verification_status: 'verified',
+        updated_at: new Date()
+      })
+      .eq('id', req.user.id);
+
+    if (error) throw error;
+
+    res.json({ success: true, message: 'KYC verified successfully via Surepass.', data: surepassData.data });
+  } catch (error) {
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    console.error('Surepass proxy error:', error?.response?.data || error.message);
+    res.status(500).json({ success: false, error: error?.response?.data?.message || error.message || 'Internal server error' });
+  }
+});
+
+// ==========================================
 // BULK PRICE UPLOAD (MUST BE HERE)
 // ==========================================
 const csv = require('csv-parser');
@@ -530,6 +698,9 @@ app.use((err, req, res, next) => {
   console.error('Unhandled Server Error:', err);
   res.status(err.status || 500).json({ success: false, error: err.message || 'Internal Server Error' });
 });
+
+// Load external bank routes
+require('./bankRoutes')(app, supabase, authenticateToken, razorpay);
 
 const port = parseInt(process.env.PORT, 10) || 10000;
 const server = app.listen(port, () => console.log(`🚀 Server running on port ${port} [${process.env.NODE_ENV || 'development'} mode]`));

@@ -22,6 +22,7 @@ app.use(cors());
 // 🔌 Initialize express-ws for WebSocket support (chat rooms)
 const expressWs = require('express-ws')(app);
 const chatRooms = {}; // { order_id: Set<WebSocket> }
+const globalConnections = new Map(); // { user_id: WebSocket }
 
 // 🚀 Increased payload limits for large CSV files
 app.use(express.json({ limit: '500mb' }));
@@ -197,7 +198,7 @@ app.get('/api/orders/:id', authenticateToken, async (req, res) => {
       .single();
 
     if (error || !data) throw new Error(error?.message || 'Order not found');
-    
+
     // Format data to match what OrderTracking.tsx expects
     const formattedData = {
       ...data,
@@ -319,6 +320,27 @@ app.post('/api/trader/bid', authenticateToken, async (req, res) => {
     const { listing_id, amount, quantity, message } = req.body;
     const { data, error } = await req.userSupabase.from('bids').insert([{ listing_id, trader_id: req.user.id, amount, quantity, message }]).select().single();
     if (error) throw error;
+
+    // ⚡ Real-time Notification: Notify the farmer if they are online
+    try {
+      const { data: listing } = await supabase.from('crop_listings').select('farmer_id').eq('id', listing_id).single();
+      if (listing?.farmer_id) {
+        const farmerWs = globalConnections.get(listing.farmer_id);
+        if (farmerWs && farmerWs.readyState === 1) {
+          farmerWs.send(JSON.stringify({
+            type: 'NEW_BID',
+            data: {
+              ...data,
+              trader_name: req.user.user_metadata?.full_name || 'A Trader',
+              timestamp: new Date().toISOString()
+            }
+          }));
+        }
+      }
+    } catch (wsErr) {
+      console.error('Failed to send bid notification:', wsErr);
+    }
+
     res.status(201).json({ message: 'Bid placed', data });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -356,7 +378,7 @@ app.post('/api/payment/create', authenticateToken, async (req, res) => {
   try {
     const { listing_id, Math: _m, amount: rawAmount, order_id: customReceipt, quantity = 1, agreed_price } = req.body;
     const traderId = req.user.id;
-    
+
     // We fall back to rawAmount if agreed_price and quantity aren't properly passed for cart flows
     const effectivePrice = agreed_price || rawAmount;
     const effectiveQty = quantity || 1;
@@ -367,7 +389,7 @@ app.post('/api/payment/create', authenticateToken, async (req, res) => {
       .select('*, users!farmer_id(id, full_name)')
       .eq('id', listing_id)
       .single();
-      
+
     const { data: bankAccount } = await supabase
       .from('bank_accounts')
       .select('razorpay_linked_account_id, razorpay_fund_account_id, is_verified')
@@ -403,9 +425,9 @@ app.post('/api/payment/create', authenticateToken, async (req, res) => {
     }
 
     const razorpayOrder = await razorpay.orders.create(orderPayload);
-    res.status(200).json({ 
-      success: true, 
-      razorpay_order_id: razorpayOrder.id, 
+    res.status(200).json({
+      success: true,
+      razorpay_order_id: razorpayOrder.id,
       amount: totalPaise,
       farmer_bank_linked: !!farmerLinkedAccId,
       platform_fee: platformFeePaise / 100,
@@ -560,7 +582,7 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
     ]);
 
     const allOrders = orderStats || [];
-    const activeStatuses = ['placed','confirmed','dispatched','delivered'];
+    const activeStatuses = ['placed', 'confirmed', 'dispatched', 'delivered'];
     const totalGmv = (gmvStats || []).reduce((s, o) => s + (o.final_amount || 0), 0);
     const platformRevenue = totalGmv * 0.03;
     const avgOrderValue = gmvStats?.length ? totalGmv / gmvStats.length : 0;
@@ -643,7 +665,7 @@ app.post('/api/admin/kyc/:userId/decision', authenticateToken, requireAdmin, asy
     const { decision, reason } = req.body;
     const targetId = req.params.userId;
 
-    if (!['approved','rejected'].includes(decision))
+    if (!['approved', 'rejected'].includes(decision))
       return res.status(400).json({ error: 'Invalid decision' });
 
     await supabase.from('farmer_kyc').update({
@@ -685,7 +707,7 @@ app.post('/api/admin/kyc/:userId/decision', authenticateToken, requireAdmin, asy
               amount: paise, currency: 'INR', mode: 'IMPS',
               purpose: 'payout', queue_if_low_balance: true,
               reference_id: order.id,
-              narration: `KrishiSethu order ${order.id.slice(0,8)}`,
+              narration: `KrishiSethu order ${order.id.slice(0, 8)}`,
             });
             await supabase.from('orders').update({
               payment_status: 'paid', paid_at: new Date(), status: 'paid'
@@ -796,7 +818,7 @@ app.post('/api/admin/disputes/:id/resolve', authenticateToken, requireAdmin, asy
           currency: 'INR', mode: 'IMPS', purpose: 'payout',
           queue_if_low_balance: true,
           reference_id: dispute.order_id,
-          narration: `Dispute resolved: KrishiSethu ${dispute.order_id.slice(0,8)}`,
+          narration: `Dispute resolved: KrishiSethu ${dispute.order_id.slice(0, 8)}`,
         }).catch(e => console.warn('Dispute payout failed:', e.message));
       }
     }
@@ -868,7 +890,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
 app.patch('/api/admin/users/:id/status', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { status } = req.body;
-    if (!['active','suspended'].includes(status))
+    if (!['active', 'suspended'].includes(status))
       return res.status(400).json({ error: 'Invalid status' });
 
     await supabase.from('users').update({ status, updated_at: new Date() }).eq('id', req.params.id);
@@ -899,7 +921,7 @@ app.get('/api/admin/payouts', authenticateToken, requireAdmin, async (req, res) 
     if (status && status !== 'all') {
       query = query.eq('payment_status', status);
     } else {
-      query = query.in('payment_status', ['failed','kyc_pending','bank_pending']);
+      query = query.in('payment_status', ['failed', 'kyc_pending', 'bank_pending']);
     }
 
     const { data, error } = await query;
@@ -957,7 +979,7 @@ app.post('/api/admin/payouts/:orderId/pay', authenticateToken, requireAdmin, asy
         amount: farmerPaise, currency: 'INR', mode: 'IMPS',
         purpose: 'payout', queue_if_low_balance: true,
         reference_id: `admin_${orderId}`,
-        narration: `Admin override: KrishiSethu ${orderId.slice(0,8)}`,
+        narration: `Admin override: KrishiSethu ${orderId.slice(0, 8)}`,
       });
     }
 
@@ -987,7 +1009,7 @@ app.get('/api/admin/dashboard', authenticateToken, async (req, res) => {
 
 app.put('/api/admin/order/:id/resolve', authenticateToken, async (req, res) => {
   try {
-    const { action } = req.body; 
+    const { action } = req.body;
     let newStatus = action === 'refund_trader' ? 'cancelled' : 'completed';
     let paymentStatus = action === 'refund_trader' ? 'refunded' : 'paid';
 
@@ -1066,12 +1088,12 @@ app.post('/api/user/kyc/surepass', authenticateToken, upload.single('document'),
     });
 
     const surepassData = surepassRes.data;
-    
+
     // Clean up local temp file
     if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
     if (surepassData.status_code !== 200 || !surepassData.data) {
-       throw new Error(`Surepass Error: ${surepassData.message || 'Verification failed.'}`);
+      throw new Error(`Surepass Error: ${surepassData.message || 'Verification failed.'}`);
     }
 
     // Update user verification status securely utilizing the Service Role Key implicitly on the backend
@@ -1190,7 +1212,7 @@ app.post('/api/admin/prices/bulk', authenticateToken, async (req, res) => {
 // ==========================================
 app.delete('/api/admin/prices', authenticateToken, async (req, res) => {
   try {
-    const { error } = await supabase.from('market_prices').delete().not('id', 'is', null); 
+    const { error } = await supabase.from('market_prices').delete().not('id', 'is', null);
     if (error) throw error;
     res.status(200).json({ success: true, message: 'All market prices cleared successfully!' });
   } catch (error) {
@@ -1207,13 +1229,13 @@ app.use((err, req, res, next) => {
     console.error('Bad JSON Syntax:', err.message);
     return res.status(400).json({ success: false, error: 'Invalid JSON payload format.' });
   }
-  
+
   // Catch payload too large errors (e.g., from express.json limit)
   if (err.type === 'entity.too.large') {
     console.error('Payload Too Large:', err.message);
     return res.status(413).json({ success: false, error: 'Payload size exceeds the 500MB limit.' });
   }
-  
+
   // Generic fallback for other errors
   console.error('Unhandled Server Error:', err);
   res.status(err.status || 500).json({ success: false, error: err.message || 'Internal Server Error' });
@@ -1221,6 +1243,7 @@ app.use((err, req, res, next) => {
 
 // Load external bank routes
 require('./bankRoutes')(app, supabase, authenticateToken, razorpay);
+require('./mandiRoutes')(app, supabase, authenticateToken, requireAdmin);
 
 const port = parseInt(process.env.PORT, 10) || 10000;
 const server = app.listen(port, () => console.log(`🚀 Server running on port ${port} [${process.env.NODE_ENV || 'development'} mode]`));
@@ -1228,10 +1251,10 @@ const server = app.listen(port, () => console.log(`🚀 Server running on port $
 // 💬 WebSocket chat rooms — /ws?order_id=<id>&token=<jwt>
 // Broadcasts messages to all clients in the same order room
 app.ws('/ws', async (ws, req) => {
-  const { order_id, token } = req.query;
+  const { order_id, user_id, token } = req.query;
 
-  if (!order_id || !token) {
-    ws.close(1008, 'Missing order_id or token');
+  if (!token) {
+    ws.close(1008, 'Token required');
     return;
   }
 
@@ -1242,29 +1265,47 @@ app.ws('/ws', async (ws, req) => {
     return;
   }
 
-  const userId = data.user.id;
-  console.log(`🔗 WS: User ${userId} joined room ${order_id}`);
+  const authenticatedUserId = data.user.id;
 
-  // Add to room
-  if (!chatRooms[order_id]) chatRooms[order_id] = new Set();
-  chatRooms[order_id].add(ws);
+  // CASE 1: Chat Room (order_id provided)
+  if (order_id) {
+    console.log(`🔗 WS: User ${authenticatedUserId} joined CHAT room ${order_id}`);
+    if (!chatRooms[order_id]) chatRooms[order_id] = new Set();
+    chatRooms[order_id].add(ws);
 
-  ws.on('message', (msg) => {
-    // Broadcast to everyone else in the same room
-    chatRooms[order_id]?.forEach(client => {
-      if (client !== ws && client.readyState === 1) {
-        client.send(msg);
-      }
+    ws.on('message', (msg) => {
+      chatRooms[order_id]?.forEach(client => {
+        if (client !== ws && client.readyState === 1) client.send(msg);
+      });
     });
-  });
 
-  ws.on('close', () => {
-    chatRooms[order_id]?.delete(ws);
-    if (chatRooms[order_id]?.size === 0) delete chatRooms[order_id];
-    console.log(`🔌 WS: User ${userId} left room ${order_id}`);
-  });
+    ws.on('close', () => {
+      chatRooms[order_id]?.delete(ws);
+      if (chatRooms[order_id]?.size === 0) delete chatRooms[order_id];
+    });
+  }
+
+  // CASE 2: Global Notifications (user_id provided)
+  else if (user_id) {
+    // Basic validation: User can only subscribe to their own notification stream
+    if (user_id !== authenticatedUserId) {
+      ws.close(1008, 'Forbidden: Cannot subscribe to another user\'s stream');
+      return;
+    }
+
+    console.log(`📡 WS: User ${authenticatedUserId} joined NOTIFICATION stream`);
+
+    // Global connections map for notifications
+    if (!globalConnections) globalConnections = new Map();
+    globalConnections.set(authenticatedUserId, ws);
+
+    ws.on('close', () => {
+      globalConnections.delete(authenticatedUserId);
+      console.log(`🔌 WS: User ${authenticatedUserId} left notification stream`);
+    });
+  }
 
   ws.on('error', (err) => {
-    console.error(`WS error for user ${userId} in room ${order_id}:`, err);
+    console.error(`WS error for user ${authenticatedUserId}:`, err);
   });
 });

@@ -10,6 +10,7 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const FormData = require('form-data');
 const axios = require('axios');
+
 // Load env based on NODE_ENV: .env.production in prod, .env.development in dev
 const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
 dotenv.config({ path: `${__dirname}/${envFile}` });
@@ -77,6 +78,33 @@ const authenticateToken = async (req, res, next) => {
     next();
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Auth failed' });
+  }
+};
+
+// ==========================================
+// SMS HELPER (Fast2SMS)
+// ==========================================
+const sendSMS = async (phones, message) => {
+  const apiKey = process.env.FAST2SMS_API_KEY;
+  if (!apiKey) {
+    console.warn('[SMS] FAST2SMS_API_KEY not set — skipping SMS');
+    return;
+  }
+  // phones can be a single string or array; Fast2SMS accepts comma-separated
+  const numbers = Array.isArray(phones) ? phones.join(',') : phones;
+  if (!numbers) return;
+  try {
+    const res = await axios.post(
+      'https://www.fast2sms.com/dev/bulkV2',
+      { route: 'q', message, language: 'english', flash: 0, numbers },
+      { headers: { authorization: apiKey }, timeout: 8000 }
+    );
+    if (res.data?.return !== true)
+      console.warn('[SMS] Fast2SMS response:', res.data);
+    else
+      console.log(`[SMS] Sent to ${numbers}`);
+  } catch (err) {
+    console.error('[SMS] Failed to send:', err.message);
   }
 };
 
@@ -278,10 +306,23 @@ app.put('/api/farmer/order/:id/confirm-payment', authenticateToken, async (req, 
     // Update order
     await supabase.from('orders').update({
       payment_status: 'paid',
-      payout_reference: payoutResult?.id || null, // Might be null if fallback Option C
+      payout_reference: payoutResult?.id || null,
       farmer_confirmed_at: new Date(),
       updated_at: new Date(),
     }).eq('id', orderId);
+
+    // 📱 SMS: Confirm payout to farmer
+    try {
+      const { data: farmer } = await supabase.from('users').select('phone').eq('id', farmerId).single();
+      if (farmer?.phone) {
+        const msg = payoutResult
+          ? `KrishiSethu: Aapka payment aapke bank account me transfer ho gaya hai! Reference: ${payoutResult.id?.slice(0, 12)}`
+          : `KrishiSethu: Delivery confirm ho gayi. Payment 24 ghante me aapke account me aa jayega.`;
+        await sendSMS(farmer.phone, msg);
+      }
+    } catch (smsErr) {
+      console.error('[SMS] Payout notification failed:', smsErr.message);
+    }
 
     res.json({
       success: true,
@@ -300,12 +341,26 @@ app.put('/api/farmer/bid/:id/accept', authenticateToken, async (req, res) => {
   try {
     const { listing_id } = req.body;
     // ⚡ Atomic transaction via Supabase RPC — prevents race conditions
-    // All 4 operations (accept bid, reject others, mark sold, create order) run in one DB transaction
     const { error } = await req.userSupabase.rpc('accept_bid', {
       p_bid_id: req.params.id,
       p_listing_id: listing_id
     });
     if (error) throw error;
+
+    // 📱 SMS: Notify trader their bid was accepted
+    try {
+      const { data: bid } = await supabase.from('bids').select('trader_id, amount, quantity').eq('id', req.params.id).single();
+      if (bid?.trader_id) {
+        const { data: trader } = await supabase.from('users').select('phone').eq('id', bid.trader_id).single();
+        const { data: farmer } = await supabase.from('users').select('full_name').eq('id', req.user.id).single();
+        if (trader?.phone) {
+          await sendSMS(trader.phone, `KrishiSethu: ${farmer?.full_name || 'Farmer'} ne aapka ₹${bid.amount}/kg bid accept kar liya. App me order dekhe aur payment karein.`);
+        }
+      }
+    } catch (smsErr) {
+      console.error('[SMS] Bid-accept notification failed:', smsErr.message);
+    }
+
     res.status(200).json({ message: 'Bid accepted successfully.' });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -339,6 +394,20 @@ app.post('/api/trader/bid', authenticateToken, async (req, res) => {
       }
     } catch (wsErr) {
       console.error('Failed to send bid notification:', wsErr);
+    }
+
+    // 📱 SMS: Notify farmer of new bid
+    try {
+      const { data: listing } = await supabase.from('crop_listings').select('farmer_id').eq('id', listing_id).single();
+      if (listing?.farmer_id) {
+        const { data: farmer } = await supabase.from('users').select('phone, full_name').eq('id', listing.farmer_id).single();
+        if (farmer?.phone) {
+          const traderName = req.user.user_metadata?.full_name || 'A trader';
+          await sendSMS(farmer.phone, `KrishiSethu: ${traderName} ne aapki fasal par ₹${amount}/kg ka bid lagaya hai. App me dekhein.`);
+        }
+      }
+    } catch (smsErr) {
+      console.error('[SMS] Bid notification failed:', smsErr.message);
     }
 
     res.status(201).json({ message: 'Bid placed', data });
@@ -447,6 +516,20 @@ app.post('/api/payment/verify', authenticateToken, async (req, res) => {
     if (expectedSignature !== razorpay_signature) return res.status(400).json({ success: false, error: 'Invalid payment signature.' });
 
     await supabase.from('orders').update({ status: 'completed', payment_status: 'processing', razorpay_payment_id, updated_at: new Date() }).eq('id', order_id);
+
+    // 📱 SMS: Notify farmer payment received, delivery pending
+    try {
+      const { data: order } = await supabase.from('orders').select('farmer_id, final_amount').eq('id', order_id).single();
+      if (order?.farmer_id) {
+        const { data: farmer } = await supabase.from('users').select('phone').eq('id', order.farmer_id).single();
+        if (farmer?.phone) {
+          await sendSMS(farmer.phone, `KrishiSethu: Trader ne ₹${order.final_amount} payment ki hai. Fasal deliver karein aur app me confirm karein taaki payment aapke account me aaye.`);
+        }
+      }
+    } catch (smsErr) {
+      console.error('[SMS] Payment verify notification failed:', smsErr.message);
+    }
+
     res.status(200).json({ success: true, message: 'Payment verified!' });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -543,504 +626,6 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 });
 
 
-// ==========================================
-// ADMIN PORTAL ENDPOINTS
-// ==========================================
-// ── Admin auth middleware ─────────────────────────────────────
-const requireAdmin = async (req, res, next) => {
-  try {
-    const { data: user } = await supabase
-      .from('users').select('role').eq('id', req.user.id).single();
-    if (user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-    next();
-  } catch { res.status(403).json({ error: 'Forbidden' }); }
-};
-
-// ============================================================
-// ROUTE 1: Platform stats
-// GET /api/admin/stats
-// ============================================================
-app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const [
-      { count: totalFarmers },
-      { count: totalTraders },
-      { data: orderStats },
-      { data: gmvStats },
-      { count: pendingKyc },
-      { count: openDisputes },
-      { count: pendingPayouts },
-    ] = await Promise.all([
-      supabase.from('users').select('*', { count: 'exact', head: true }).eq('role', 'farmer'),
-      supabase.from('users').select('*', { count: 'exact', head: true }).eq('role', 'trader'),
-      supabase.from('orders').select('status, final_amount'),
-      supabase.from('orders').select('final_amount').eq('status', 'paid'),
-      supabase.from('farmer_kyc').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
-      supabase.from('order_disputes').select('*', { count: 'exact', head: true }).eq('status', 'open'),
-      supabase.from('orders').select('*', { count: 'exact', head: true })
-        .in('payment_status', ['kyc_pending', 'bank_pending', 'failed']),
-    ]);
-
-    const allOrders = orderStats || [];
-    const activeStatuses = ['placed', 'confirmed', 'dispatched', 'delivered'];
-    const totalGmv = (gmvStats || []).reduce((s, o) => s + (o.final_amount || 0), 0);
-    const platformRevenue = totalGmv * 0.03;
-    const avgOrderValue = gmvStats?.length ? totalGmv / gmvStats.length : 0;
-
-    res.json({
-      total_farmers: totalFarmers || 0,
-      total_traders: totalTraders || 0,
-      total_orders: allOrders.length,
-      active_orders: allOrders.filter(o => activeStatuses.includes(o.status)).length,
-      total_gmv: totalGmv,
-      platform_revenue: platformRevenue,
-      avg_order_value: avgOrderValue,
-      pending_kyc: pendingKyc || 0,
-      open_disputes: openDisputes || 0,
-      pending_payouts: pendingPayouts || 0,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 2: KYC list
-// GET /api/admin/kyc?status=pending|approved|rejected
-// ============================================================
-app.get('/api/admin/kyc', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const status = req.query.status || 'pending';
-    const { data, error } = await supabase
-      .from('farmer_kyc')
-      .select(`
-        id, user_id, pan_number, pan_name, pan_dob,
-        aadhaar_last4, aadhaar_name, aadhaar_address,
-        selfie_path, aadhaar_doc_path, face_match_score,
-        status, submitted_at, rejection_reason,
-        user:users!user_id(full_name, phone, email)
-      `)
-      .eq('status', status)
-      .order('submitted_at', { ascending: true })
-      .limit(100);
-
-    if (error) throw error;
-
-    // Generate signed URLs for private KYC docs (valid 1 hour)
-    const records = await Promise.all((data || []).map(async k => {
-      let selfieUrl = null, docUrl = null;
-      if (k.selfie_path) {
-        const { data: u } = await supabase.storage.from('kyc-documents')
-          .createSignedUrl(k.selfie_path, 3600);
-        selfieUrl = u?.signedUrl;
-      }
-      if (k.aadhaar_doc_path) {
-        const { data: u } = await supabase.storage.from('kyc-documents')
-          .createSignedUrl(k.aadhaar_doc_path, 3600);
-        docUrl = u?.signedUrl;
-      }
-      return {
-        ...k,
-        user_name: k.user?.full_name,
-        user_phone: k.user?.phone,
-        user_email: k.user?.email,
-        selfie_url: selfieUrl,
-        aadhaar_doc_url: docUrl,
-      };
-    }));
-
-    res.json(records);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 3: KYC approve/reject
-// POST /api/admin/kyc/:userId/decision
-// Body: { decision: 'approved'|'rejected', reason? }
-// ============================================================
-app.post('/api/admin/kyc/:userId/decision', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { decision, reason } = req.body;
-    const targetId = req.params.userId;
-
-    if (!['approved', 'rejected'].includes(decision))
-      return res.status(400).json({ error: 'Invalid decision' });
-
-    await supabase.from('farmer_kyc').update({
-      status: decision,
-      rejection_reason: decision === 'rejected' ? (reason || 'Documents did not meet requirements') : null,
-      reviewed_by: req.user.id,
-      verified_at: decision === 'approved' ? new Date() : null,
-      updated_at: new Date(),
-    }).eq('user_id', targetId);
-
-    if (decision === 'approved') {
-      await supabase.from('users').update({ kyc_verified: true }).eq('id', targetId);
-
-      // Update Razorpay Route linked account with verified PAN
-      const { data: kyc } = await supabase.from('farmer_kyc')
-        .select('pan_number').eq('user_id', targetId).single();
-      const { data: bank } = await supabase.from('bank_accounts')
-        .select('razorpay_linked_account_id').eq('user_id', targetId).maybeSingle();
-
-      if (kyc?.pan_number && bank?.razorpay_linked_account_id) {
-        await razorpayFetch(`/beta/accounts/${bank.razorpay_linked_account_id}`, 'PATCH', {
-          legal_info: { pan: kyc.pan_number }
-        }).catch(e => console.warn('Razorpay KYC update:', e.message));
-      }
-
-      // Release any orders that were stuck on kyc_pending
-      const { data: stuck } = await supabase.from('orders')
-        .select('id, final_amount, farmer_fund_account_id, razorpay_order_id')
-        .eq('farmer_id', targetId).eq('payment_status', 'kyc_pending');
-
-      for (const order of stuck || []) {
-        // Re-trigger payout — reuse confirm-payment logic
-        try {
-          const paise = Math.round(order.final_amount * 97);
-          if (order.farmer_fund_account_id) {
-            await razorpayFetch('/payouts', 'POST', {
-              account_number: process.env.RAZORPAY_X_ACCOUNT_NUMBER,
-              fund_account_id: order.farmer_fund_account_id,
-              amount: paise, currency: 'INR', mode: 'IMPS',
-              purpose: 'payout', queue_if_low_balance: true,
-              reference_id: order.id,
-              narration: `KrishiSethu order ${order.id.slice(0, 8)}`,
-            });
-            await supabase.from('orders').update({
-              payment_status: 'paid', paid_at: new Date(), status: 'paid'
-            }).eq('id', order.id);
-          }
-        } catch (payErr) {
-          console.warn('Post-KYC payout failed for order', order.id, payErr.message);
-        }
-      }
-    }
-
-    // TODO: Send SMS to farmer with KYC result
-
-    res.json({ success: true, decision });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 4: Disputes list
-// GET /api/admin/disputes?status=open|resolved|closed
-// ============================================================
-app.get('/api/admin/disputes', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const status = req.query.status || 'open';
-    const { data, error } = await supabase
-      .from('order_disputes')
-      .select(`
-        id, order_id, reason, details, status, resolution, created_at,
-        raiser:users!raised_by(full_name),
-        order:orders!order_id(
-          final_amount,
-          listing:listings!listing_id(crop_name),
-          farmer:users!farmer_id(full_name, phone),
-          trader:users!trader_id(full_name, phone)
-        )
-      `)
-      .eq('status', status)
-      .order('created_at', { ascending: true });
-
-    if (error) throw error;
-
-    res.json((data || []).map(d => ({
-      id: d.id,
-      order_id: d.order_id,
-      reason: d.reason,
-      details: d.details,
-      status: d.status,
-      resolution: d.resolution,
-      created_at: d.created_at,
-      raised_by_name: d.raiser?.full_name,
-      crop_name: d.order?.listing?.crop_name,
-      final_amount: d.order?.final_amount,
-      farmer_name: d.order?.farmer?.full_name,
-      farmer_phone: d.order?.farmer?.phone,
-      trader_name: d.order?.trader?.full_name,
-      trader_phone: d.order?.trader?.phone,
-    })));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 5: Resolve dispute
-// POST /api/admin/disputes/:id/resolve
-// Body: { decision: 'farmer'|'trader'|'split', resolution }
-// ============================================================
-app.post('/api/admin/disputes/:id/resolve', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { decision, resolution } = req.body;
-    const disputeId = req.params.id;
-
-    const { data: dispute } = await supabase
-      .from('order_disputes').select('order_id').eq('id', disputeId).single();
-    if (!dispute) return res.status(404).json({ error: 'Dispute not found' });
-
-    // Update dispute record
-    await supabase.from('order_disputes').update({
-      status: 'resolved',
-      resolution: `[${decision.toUpperCase()}] ${resolution}`,
-      resolved_by: req.user.id,
-      resolved_at: new Date(),
-    }).eq('id', disputeId);
-
-    // Update order status
-    const newOrderStatus = decision === 'farmer' ? 'cancelled' : 'paid';
-    await supabase.from('orders').update({
-      status: newOrderStatus,
-      updated_at: new Date(),
-    }).eq('id', dispute.order_id);
-
-    // If in favour of farmer — handle refund to trader (manual)
-    // If in favour of trader — release payment to farmer
-    if (decision === 'trader') {
-      // Attempt payout — same logic as confirm-payment
-      const { data: order } = await supabase.from('orders')
-        .select('*, bank_accounts!farmer_id(razorpay_fund_account_id, razorpay_linked_account_id)')
-        .eq('id', dispute.order_id).single();
-
-      const fundAccId = order?.bank_accounts?.razorpay_fund_account_id;
-      if (fundAccId) {
-        await razorpayFetch('/payouts', 'POST', {
-          account_number: process.env.RAZORPAY_X_ACCOUNT_NUMBER,
-          fund_account_id: fundAccId,
-          amount: Math.round(order.final_amount * 97),
-          currency: 'INR', mode: 'IMPS', purpose: 'payout',
-          queue_if_low_balance: true,
-          reference_id: dispute.order_id,
-          narration: `Dispute resolved: KrishiSethu ${dispute.order_id.slice(0, 8)}`,
-        }).catch(e => console.warn('Dispute payout failed:', e.message));
-      }
-    }
-
-    // TODO: SMS both parties with outcome
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 6: Users list
-// GET /api/admin/users?search=&role=farmer|trader|all
-// ============================================================
-app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { search, role } = req.query;
-
-    let query = supabase
-      .from('users')
-      .select(`
-        id, full_name, phone, email, role, status, kyc_verified,
-        avg_rating, rating_count, village, city, created_at
-      `)
-      .order('created_at', { ascending: false })
-      .limit(200);
-
-    if (role && role !== 'all') query = query.eq('role', role);
-    if (search) query = query.or(`full_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
-
-    const { data: users, error } = await query;
-    if (error) throw error;
-
-    // Get per-user order stats
-    const userIds = (users || []).map(u => u.id);
-    const { data: orderData } = await supabase
-      .from('orders')
-      .select('farmer_id, trader_id, final_amount, status')
-      .or(`farmer_id.in.(${userIds.join(',')}),trader_id.in.(${userIds.join(',')})`)
-      .in('status', ['paid']);
-
-    const statsMap = {};
-    for (const o of orderData || []) {
-      const fid = o.farmer_id; const tid = o.trader_id;
-      if (!statsMap[fid]) statsMap[fid] = { total: 0, gmv: 0 };
-      if (!statsMap[tid]) statsMap[tid] = { total: 0, gmv: 0 };
-      statsMap[fid].total++; statsMap[fid].gmv += o.final_amount || 0;
-      statsMap[tid].total++; statsMap[tid].gmv += o.final_amount || 0;
-    }
-
-    res.json((users || []).map(u => ({
-      ...u,
-      joined_at: u.created_at,
-      total_orders: statsMap[u.id]?.total || 0,
-      total_gmv: statsMap[u.id]?.gmv || 0,
-    })));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 7: Update user status (suspend / reactivate)
-// PATCH /api/admin/users/:id/status
-// Body: { status: 'active'|'suspended' }
-// ============================================================
-app.patch('/api/admin/users/:id/status', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { status } = req.body;
-    if (!['active', 'suspended'].includes(status))
-      return res.status(400).json({ error: 'Invalid status' });
-
-    await supabase.from('users').update({ status, updated_at: new Date() }).eq('id', req.params.id);
-    res.json({ success: true, status });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 8: Stuck payouts list
-// GET /api/admin/payouts?status=all|failed|kyc_pending|bank_pending
-// ============================================================
-app.get('/api/admin/payouts', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const { status } = req.query;
-
-    let query = supabase
-      .from('orders')
-      .select(`
-        id, final_amount, created_at, payment_status,
-        farmer:users!farmer_id(full_name, phone),
-        bank:bank_accounts!farmer_id(bank_id),
-        listing:listings!listing_id(crop_name)
-      `)
-      .order('created_at', { ascending: true });
-
-    if (status && status !== 'all') {
-      query = query.eq('payment_status', status);
-    } else {
-      query = query.in('payment_status', ['failed', 'kyc_pending', 'bank_pending']);
-    }
-
-    const { data, error } = await query;
-    if (error) throw error;
-
-    res.json((data || []).map(o => ({
-      id: o.id,
-      order_id: o.id,
-      farmer_name: o.farmer?.full_name,
-      farmer_phone: o.farmer?.phone,
-      bank_name: o.bank?.bank_id,
-      final_amount: o.final_amount,
-      payout_amount: Math.round(o.final_amount * 0.97),
-      status: o.payment_status,
-      created_at: o.created_at,
-    })));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// ROUTE 9: Manual payout override
-// POST /api/admin/payouts/:orderId/pay
-// ============================================================
-app.post('/api/admin/payouts/:orderId/pay', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const orderId = req.params.orderId;
-
-    const { data: order } = await supabase
-      .from('orders')
-      .select('*, bank_accounts!farmer_id(razorpay_fund_account_id, razorpay_linked_account_id, is_verified)')
-      .eq('id', orderId).single();
-
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-
-    const bank = order.bank_accounts;
-    if (!bank?.is_verified) return res.status(400).json({ error: 'Farmer has no verified bank account' });
-
-    const farmerPaise = Math.round(order.final_amount * 97);
-    let payoutResult = null;
-
-    if (bank.razorpay_linked_account_id) {
-      const transfers = await razorpayFetch(`/orders/${order.razorpay_order_id}/transfers`).catch(() => null);
-      const transfer = transfers?.items?.[0];
-      if (transfer?.on_hold) {
-        payoutResult = await razorpayFetch(`/transfers/${transfer.id}`, 'PATCH', { on_hold: 0 });
-      }
-    }
-
-    if (!payoutResult && bank.razorpay_fund_account_id) {
-      payoutResult = await razorpayFetch('/payouts', 'POST', {
-        account_number: process.env.RAZORPAY_X_ACCOUNT_NUMBER,
-        fund_account_id: bank.razorpay_fund_account_id,
-        amount: farmerPaise, currency: 'INR', mode: 'IMPS',
-        purpose: 'payout', queue_if_low_balance: true,
-        reference_id: `admin_${orderId}`,
-        narration: `Admin override: KrishiSethu ${orderId.slice(0, 8)}`,
-      });
-    }
-
-    if (!payoutResult) return res.status(400).json({ error: 'No valid payout method found for this farmer' });
-
-    await supabase.from('orders').update({
-      payment_status: 'paid', paid_at: new Date(),
-      status: 'paid', payout_reference: payoutResult.id,
-      updated_at: new Date(),
-    }).eq('id', orderId);
-
-    res.json({ success: true, payout_id: payoutResult.id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/admin/dashboard', authenticateToken, async (req, res) => {
-  try {
-    const { data: orders, error } = await supabase.from('orders').select(`*, crop_listings (variety, quantity, unit), farmer:users!farmer_id (full_name, phone), trader:users!trader_id (full_name, phone)`).order('created_at', { ascending: false });
-    if (error) throw error;
-    res.status(200).json(orders);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/api/admin/order/:id/resolve', authenticateToken, async (req, res) => {
-  try {
-    const { action } = req.body;
-    let newStatus = action === 'refund_trader' ? 'cancelled' : 'completed';
-    let paymentStatus = action === 'refund_trader' ? 'refunded' : 'paid';
-
-    const { data, error } = await supabase.from('orders').update({ status: newStatus, payment_status: paymentStatus, updated_at: new Date() }).eq('id', req.params.id).select();
-    if (error) throw error;
-    res.status(200).json({ success: true, message: 'Dispute resolved successfully', data });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/admin/verifications', authenticateToken, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('users').select('id, full_name, role, phone, email, location, business_name, verification_status, document_type, document_url, created_at').eq('verification_status', 'pending_verification').order('created_at', { ascending: false });
-    if (error) throw error;
-    res.status(200).json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.put('/api/admin/verify/:userId', authenticateToken, async (req, res) => {
-  try {
-    const { status } = req.body;
-    const { data, error } = await supabase.from('users').update({ verification_status: status }).eq('id', req.params.userId).select();
-    if (error) throw error;
-    res.status(200).json({ success: true, message: `User marked as ${status}`, data });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 app.post('/api/user/kyc', authenticateToken, upload.array('documents', 5), async (req, res) => {
   try {
@@ -1241,9 +826,238 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ success: false, error: err.message || 'Internal Server Error' });
 });
 
-// Load external bank routes
-require('./bankRoutes')(app, supabase, authenticateToken, razorpay);
-require('./mandiRoutes')(app, supabase, authenticateToken, requireAdmin);
+// ============================================================
+// BANK ONBOARDING & PAYOUT ROUTES (razorpay)
+// ============================================================
+const randomPennyPaise = () => Math.floor(Math.random() * 50) + 50; 
+
+const razorpayFetch = async (path, method = 'GET', body = null) => {
+  const auth = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+  const url = `https://api.razorpay.com/v1${path}`;
+  
+  console.log(`[RAZORPAY] ${method} ${url}`);
+  const res = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${auth}` },
+    body: body ? JSON.stringify(body) : null,
+  });
+
+  const data = await res.json().catch(() => null);
+  
+  if (!res.ok) {
+    const errorDesc = data?.error?.description || data?.message || res.statusText;
+    console.error(`[RAZORPAY_ERROR] ${res.status} ${url}:`, data);
+    throw new Error(`Razorpay Error (${res.status}): ${errorDesc}`);
+  }
+  return data;
+};
+
+app.post('/api/bank/initiate-penny-drop', authenticateToken, async (req, res) => {
+  try {
+    const isDev = process.env.NODE_ENV !== 'production';
+    const { account_holder_name, account_number, ifsc_code, upi_id, account_type, bank_id } = req.body;
+    const userId = req.user.id;
+
+    // ── DEV MODE: skip real payout, use fixed ₹1.00 ──────────────
+    if (isDev) {
+      const referenceId = `penny_dev_${userId.slice(0, 8)}_${Date.now()}`;
+      const fixedPaise = 100; // always ₹1.00 in dev
+
+      const hash = crypto
+        .createHmac('sha256', process.env.PENNY_HASH_SECRET || 'krishisethu-secret')
+        .update(`${referenceId}:${fixedPaise}`)
+        .digest('hex');
+
+      await supabase.from('bank_account_verifications').insert({
+        user_id: userId,
+        reference_id: referenceId,
+        amount_hash: hash,
+        account_holder_name,
+        account_number: account_number || null,
+        ifsc_code: ifsc_code || null,
+        upi_id: upi_id || null,
+        account_type: account_type || 'savings',
+        bank_id,
+        status: 'pending',
+        expires_at: new Date(Date.now() + 30 * 60 * 1000),
+      });
+
+      return res.json({
+        success: true,
+        reference_id: referenceId,
+        message: '[DEV] Enter ₹1.00 to proceed. No real money was sent.',
+      });
+    }
+
+    // ── PRODUCTION: real RazorpayX payout ────────────────────────
+    const useUPI = !!upi_id;
+    const amountPaise = randomPennyPaise();
+    const referenceId = `penny_${userId.replace(/-/g, '').slice(0, 12)}_${Date.now()}`;
+
+    const { data: user, error: userErr } = await supabase.from('users').select('full_name, phone, email').eq('id', userId).single();
+    if (userErr) throw new Error('User not found');
+
+    let contactId;
+    const { data: existingBank } = await supabase.from('bank_accounts').select('razorpay_contact_id').eq('user_id', userId).maybeSingle();
+    if (existingBank?.razorpay_contact_id) {
+      contactId = existingBank.razorpay_contact_id;
+    } else {
+      const contact = await razorpayFetch('/contacts', 'POST', {
+        name: account_holder_name, email: user.email || undefined, contact: user.phone, type: 'vendor', reference_id: userId,
+      });
+      contactId = contact.id;
+    }
+
+    const fundPayload = {
+      contact_id: contactId, account_type: 'bank_account',
+      ...(useUPI ? { vpa: { address: upi_id } } : { bank_account: { name: account_holder_name, ifsc: ifsc_code, account_number } }),
+    };
+    const fundAccount = await razorpayFetch('/fund_accounts', 'POST', fundPayload);
+
+    // ── Step C: Send penny via RazorpayX Payout
+    const rxAccountNumber = process.env.RAZORPAY_X_ACCOUNT_NUMBER;
+    if (!rxAccountNumber || rxAccountNumber.includes('replace_with')) {
+      throw new Error('RAZORPAY_X_ACCOUNT_NUMBER is required for production payouts.');
+    }
+
+    const payout = await razorpayFetch('/payouts', 'POST', {
+      account_number: rxAccountNumber,
+      fund_account_id: fundAccount.id,
+      amount: amountPaise,
+      currency: 'INR',
+      mode: useUPI ? 'UPI' : 'IMPS',
+      purpose: 'verification',
+      queue_if_low_balance: true,
+      reference_id: referenceId,
+      narration: 'KrishiSethu account verification',
+    });
+
+    const hash = crypto.createHmac('sha256', process.env.PENNY_HASH_SECRET || 'krishisethu-secret').update(`${referenceId}:${amountPaise}`).digest('hex');
+    await supabase.from('bank_account_verifications').insert({
+      user_id: userId, reference_id: referenceId, razorpay_contact_id: contactId, razorpay_fund_account_id: fundAccount.id,
+      razorpay_payout_id: payout.id, amount_hash: hash, account_holder_name, account_number, ifsc_code, upi_id,
+      account_type: account_type || 'savings', bank_id, status: 'pending', expires_at: new Date(Date.now() + 30 * 60 * 1000),
+    });
+
+    res.json({ success: true, reference_id: referenceId, message: `Sent ₹${(amountPaise / 100).toFixed(2)} to your account. Check your bank SMS.` });
+  } catch (err) {
+    console.error('Penny drop error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/bank/verify-penny-drop', authenticateToken, async (req, res) => {
+  try {
+    const { reference_id, entered_amount } = req.body;
+    const userId = req.user.id;
+    const enteredPaise = Math.round(parseFloat(entered_amount) * 100);
+    const { data: verification, error } = await supabase.from('bank_account_verifications').select('*').eq('reference_id', reference_id).eq('user_id', userId).eq('status', 'pending').single();
+    if (error || !verification) throw new Error('Verification session not found or expired.');
+    if (new Date() > new Date(verification.expires_at)) throw new Error('Verification window expired. Please start again.');
+    const expectedHash = crypto.createHmac('sha256', process.env.PENNY_HASH_SECRET || 'krishisethu-secret').update(`${reference_id}:${enteredPaise}`).digest('hex');
+    if (expectedHash !== verification.amount_hash) {
+      await supabase.from('bank_account_verifications').update({ attempts: (verification.attempts || 0) + 1 }).eq('reference_id', reference_id);
+      throw new Error(`Amount did not match.`);
+    }
+    await supabase.from('bank_account_verifications').update({ status: 'amount_verified' }).eq('reference_id', reference_id);
+    res.json({ success: true, message: 'Amount verified! Proceed to card security check.' });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/bank/register-with-card', authenticateToken, async (req, res) => {
+  try {
+    const { reference_id, card_last6, card_expiry_month, card_expiry_year } = req.body;
+    const userId = req.user.id;
+    const { data: verification, error } = await supabase.from('bank_account_verifications').select('*').eq('reference_id', reference_id).eq('user_id', userId).eq('status', 'amount_verified').single();
+    if (error || !verification) throw new Error('Please complete penny drop verification first.');
+    const { data: user } = await supabase.from('users').select('role, full_name, email, phone').eq('id', userId).single();
+    let linkedAccountId = null;
+    if (user.role === 'farmer' || user.role === 'trader') {
+      const linkedAccount = await razorpayFetch('/beta/accounts', 'POST', {
+        email: user.email, profile: { category: 'agriculture', subcategory: user.role === 'farmer' ? 'farmer' : 'trade', addresses: { registered: { street1: 'India', city: 'India', state: 'KA', postal_code: '560001', country: 'IN' } } },
+        legal_business_name: user.full_name, business_type: 'individual', legal_info: { pan: 'AABCU9603R' }, contact_name: user.full_name, contact_info: { phone: { primary: user.phone } },
+        bank_account: { name: verification.account_holder_name, account_number: verification.account_number, beneficiary_email: user.email, ifsc: verification.ifsc_code },
+      }).catch(() => ({ id: null }));
+      linkedAccountId = linkedAccount.id;
+    }
+    const { data: bankAccount, error: saveErr } = await supabase.from('bank_accounts').upsert({
+      user_id: userId, account_holder_name: verification.account_holder_name, account_number: verification.account_number, ifsc_code: verification.ifsc_code, upi_id: verification.upi_id,
+      account_type: verification.account_type, bank_id: verification.bank_id, card_last6, card_expiry_month, card_expiry_year, razorpay_contact_id: verification.razorpay_contact_id,
+      razorpay_fund_account_id: verification.razorpay_fund_account_id, razorpay_linked_account_id: linkedAccountId, is_verified: true, updated_at: new Date(),
+    }, { onConflict: 'user_id' }).select().single();
+    if (saveErr) throw saveErr;
+    await supabase.from('bank_account_verifications').update({ status: 'completed' }).eq('reference_id', reference_id);
+    res.json({ success: true, message: 'Bank account registered successfully!', linked_account_id: linkedAccountId, bank_account_id: bankAccount.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/bank/my-account', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('bank_accounts').select('*').eq('user_id', req.user.id).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.json({ has_account: false });
+    const masked = data.account_number ? '*'.repeat(data.account_number.length - 4) + data.account_number.slice(-4) : null;
+    res.json({ has_account: true, ...data, account_number: masked });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// MANDI PRICE FEED ROUTES (AGMARKNET)
+// ============================================================
+const mandiCache = new Map();
+const CACHE_TTL_MS = 2 * 60 * 60 * 1000; 
+const DATA_GOV_BASE = 'https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070';
+
+const fetchAgmarknet = async ({ state, commodity, limit = 100 }) => {
+  const apiKey = process.env.DATA_GOV_API_KEY;
+  if (!apiKey) throw new Error('DATA_GOV_API_KEY is missing');
+  const params = new URLSearchParams({ 'api-key': apiKey, 'format': 'json', 'limit': String(limit), 'offset': '0' });
+  if (state) params.append('filters[state]', state);
+  if (commodity) params.append('filters[commodity]', commodity);
+  const res = await fetch(`${DATA_GOV_BASE}?${params.toString()}`, { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`data.gov.in API error: ${res.status}`);
+  const json = await res.json();
+  return json.records || [];
+};
+
+app.get('/api/mandi/prices', authenticateToken, async (req, res) => {
+  try {
+    const { state = 'Karnataka', commodity } = req.query;
+    const cacheKey = `${state}:${commodity || 'all'}`;
+    const cached = mandiCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return res.json({ success: true, data: cached.data });
+
+    const raw = await fetchAgmarknet({ state, commodity, limit: 150 });
+    const records = raw.map((r, i) => ({
+      id: `${r.commodity}-${r.market}-${r.arrival_date}-${i}`, state: r.state, market: r.market, commodity: r.commodity,
+      variety: r.variety || r.commodity, arrival_date: r.arrival_date, min_price: parseFloat(r.min_price), max_price: parseFloat(r.max_price), modal_price: parseFloat(r.modal_price),
+    }));
+    mandiCache.set(cacheKey, { data: records, fetchedAt: Date.now() });
+    res.json({ success: true, data: records });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get('/api/mandi/prices/top', authenticateToken, async (req, res) => {
+  try {
+    const { commodity, limit = 10 } = req.query;
+    if (!commodity) return res.status(400).json({ error: 'commodity is required' });
+    const raw = await fetchAgmarknet({ commodity, limit: 200 });
+    const records = raw.map((r, i) => ({
+      id: `${r.commodity}-${r.market}-${r.arrival_date}-${i}`, state: r.state, market: r.market, commodity: r.commodity, modal_price: parseFloat(r.modal_price),
+    })).sort((a, b) => b.modal_price - a.modal_price).slice(0, parseInt(limit));
+    res.json({ success: true, data: records });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
 
 const port = parseInt(process.env.PORT, 10) || 10000;
 const server = app.listen(port, () => console.log(`🚀 Server running on port ${port} [${process.env.NODE_ENV || 'development'} mode]`));
@@ -1308,4 +1122,531 @@ app.ws('/ws', async (ws, req) => {
   ws.on('error', (err) => {
     console.error(`WS error for user ${authenticatedUserId}:`, err);
   });
+});
+
+// ── Admin auth middleware ─────────────────────────────────────
+const requireAdmin = async (req, res, next) => {
+  try {
+    const { data: user } = await supabase
+      .from('users').select('role').eq('id', req.user.id).single();
+    if (user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    next();
+  } catch { res.status(403).json({ error: 'Forbidden' }); }
+};
+
+// GET /api/admin/stats — Overview tab
+app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [
+      { count: totalFarmers },
+      { count: totalTraders },
+      { data: orderStats },
+      { data: gmvStats },
+      { count: pendingKycCountVal },
+      { count: pendingLegacyKycCountVal },
+      { count: openDisputesVal },
+      { count: pendingPayoutsVal },
+    ] = await Promise.all([
+      supabase.from('users').select('*', { count: 'exact', head: true }).eq('role', 'farmer'),
+      supabase.from('users').select('*', { count: 'exact', head: true }).eq('role', 'trader'),
+      supabase.from('orders').select('status, final_amount'),
+      supabase.from('orders').select('final_amount').in('status', ['completed', 'paid']),
+      supabase.from('farmer_kyc').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+      supabase.from('users').select('*', { count: 'exact', head: true }).or('verification_status.eq.pending_verification,verification_status.eq.unverified'),
+      supabase.from('order_disputes').select('*', { count: 'exact', head: true }).eq('status', 'open'),
+      supabase.from('orders').select('*', { count: 'exact', head: true })
+        .in('payment_status', ['kyc_pending', 'bank_pending', 'failed', 'yet_to_paid', 'not_paid']),
+    ]);
+
+    const totalKycPending = (pendingKycCountVal || 0) + (pendingLegacyKycCountVal || 0);
+    console.log(`[ADMIN_STATS] Pending KYC: ${totalKycPending} (New: ${pendingKycCountVal}, Legacy: ${pendingLegacyKycCountVal})`);
+    console.log(`[ADMIN_STATS] Payouts: ${pendingPayoutsVal}, Disputes: ${openDisputesVal}`);
+
+    const allOrders = orderStats || [];
+    const activeStatuses = ['placed', 'confirmed', 'dispatched', 'delivered'];
+    const totalGmv = (gmvStats || []).reduce((s, o) => s + (o.final_amount || 0), 0);
+    const platformRevenue = totalGmv * 0.03;
+    const avgOrderValue = gmvStats?.length ? totalGmv / gmvStats.length : 0;
+
+    res.json({
+      success: true,
+      data: {
+        total_farmers: totalFarmers || 0,
+        total_traders: totalTraders || 0,
+        total_orders: allOrders.length,
+        active_orders: allOrders.filter(o => activeStatuses.includes(o.status)).length,
+        total_gmv: totalGmv,
+        platform_revenue: platformRevenue,
+        avg_order_value: avgOrderValue,
+        pending_kyc: totalKycPending,
+        open_disputes: openDisputesVal || 0,
+        pending_payouts: pendingPayoutsVal || 0,
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, data: {} });
+  }
+});
+
+// GET /api/admin/kyc — KYC tab
+app.get('/api/admin/kyc', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const status = req.query.status || 'pending';
+    const { data, error } = await supabase
+      .from('farmer_kyc')
+      .select(`
+        id, user_id, pan_number, pan_name, pan_dob,
+        aadhaar_last4, aadhaar_name, aadhaar_address,
+        selfie_path, aadhaar_doc_path, face_match_score,
+        status, submitted_at, rejection_reason,
+        user:users!user_id(full_name, phone, email)
+      `)
+      .eq('status', status)
+      .order('submitted_at', { ascending: true })
+      .limit(100);
+
+    if (error) throw error;
+
+    // Merge with legacy users
+    let records = [];
+    if (status === 'approved') {
+      const { data: legacy } = await supabase
+        .from('users')
+        .select('id, full_name, phone, email, document_url, updated_at')
+        .eq('verification_status', 'verified');
+      
+      records = (legacy || []).map(u => ({
+        id: `legacy-${u.id}`, user_id: u.id, status: 'approved', submitted_at: u.updated_at,
+        user_name: u.full_name, user_phone: u.phone, user_email: u.email,
+        selfie_url: u.document_url,
+      }));
+    } else if (status === 'pending') {
+      const { data: legacy } = await supabase
+        .from('users')
+        .select('id, full_name, phone, email, document_url, updated_at')
+        .or('verification_status.eq.pending_verification,verification_status.eq.unverified');
+      
+      records = (legacy || []).map(u => ({
+        id: `legacy-${u.id}`, user_id: u.id, status: 'pending', submitted_at: u.updated_at,
+        user_name: u.full_name, user_phone: u.phone, user_email: u.email,
+        selfie_url: u.document_url,
+      }));
+    } else if (status === 'rejected') {
+      const { data: legacy } = await supabase
+        .from('users')
+        .select('id, full_name, phone, email, document_url, updated_at')
+        .eq('verification_status', 'rejected');
+      
+      records = (legacy || []).map(u => ({
+        id: `legacy-${u.id}`, user_id: u.id, status: 'rejected', submitted_at: u.updated_at,
+        user_name: u.full_name, user_phone: u.phone, user_email: u.email,
+        selfie_url: u.document_url,
+      }));
+    }
+
+    const newRecords = await Promise.all((data || []).map(async k => {
+      let selfieUrl = null, docUrl = null;
+      if (k.selfie_path) {
+        const { data: u } = await supabase.storage.from('kyc-documents').createSignedUrl(k.selfie_path, 3600);
+        selfieUrl = u?.signedUrl;
+      }
+      if (k.aadhaar_doc_path) {
+        const { data: u } = await supabase.storage.from('kyc-documents').createSignedUrl(k.aadhaar_doc_path, 3600);
+        docUrl = u?.signedUrl;
+      }
+      return {
+        ...k,
+        user_name: k.user?.full_name,
+        user_phone: k.user?.phone,
+        user_email: k.user?.email,
+        selfie_url: selfieUrl,
+        aadhaar_doc_url: docUrl,
+      };
+    }));
+
+    records = [...records, ...newRecords];
+    console.log(`[ADMIN_KYC] Fetching status=${status}. Found ${records.length} records (${newRecords.length} new, ${records.length - newRecords.length} legacy)`);
+    res.json({ success: true, data: records });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, data: [] });
+  }
+});
+
+// POST /api/admin/kyc/:userId/decision
+app.post('/api/admin/kyc/:userId/decision', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { decision, reason } = req.body;
+    const targetId = req.params.userId;
+
+    if (!['approved', 'rejected'].includes(decision))
+      return res.status(400).json({ error: 'Invalid decision' });
+
+    // Check if this is a legacy user (if no farmer_kyc record exists)
+    const { data: kycRecord } = await supabase.from('farmer_kyc').select('id').eq('user_id', targetId).maybeSingle();
+
+    if (kycRecord) {
+      await supabase.from('farmer_kyc').update({
+        status: decision,
+        rejection_reason: decision === 'rejected' ? (reason || 'Documents did not meet requirements') : null,
+        reviewed_by: req.user.id,
+        verified_at: decision === 'approved' ? new Date() : null,
+        updated_at: new Date(),
+      }).eq('user_id', targetId);
+    }
+
+    // Always update the base user record
+    await supabase.from('users').update({
+      kyc_verified: decision === 'approved',
+      verification_status: decision === 'approved' ? 'verified' : 'rejected',
+      updated_at: new Date(),
+    }).eq('id', targetId);
+
+    // SMS notification
+    const { data: farmer } = await supabase.from('users').select('phone').eq('id', targetId).single();
+    if (farmer?.phone) {
+      const msg = decision === 'approved'
+        ? `KrishiSethu: Badhai ho! Aapka KYC approved ho gaya. Ab aap fasal bech sakte hain.`
+        : `KrishiSethu: Aapka KYC rejected hua. Reason: ${reason || 'Documents incomplete'}.`;
+      await sendSMS(farmer.phone, msg);
+    }
+
+    res.json({ success: true, decision });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/admin/users?search=&role=all|farmer|trader
+app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { search = '', role = 'all' } = req.query;
+
+    let query = supabase
+      .from('users')
+      .select('id, full_name, phone, email, role, kyc_verified, location, business_name, created_at, status');
+
+    if (role !== 'all') query = query.eq('role', role);
+    if (search) {
+      query = query.or(`full_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+    }
+
+    const { data: users, error } = await query.order('created_at', { ascending: false }).limit(200);
+    if (error) throw error;
+
+    // Enrich with order stats per user
+    const enriched = await Promise.all((users || []).map(async (u) => {
+      const isfarmer = u.role === 'farmer';
+      const col = isfarmer ? 'farmer_id' : 'trader_id';
+
+      const [{ data: orders }, { data: ratings }] = await Promise.all([
+        supabase.from('orders').select('id, final_amount, status').eq(col, u.id),
+        supabase.from('order_ratings').select('rating').eq('ratee_id', u.id),
+      ]);
+
+      const totalOrders = orders?.length || 0;
+      const totalGmv = (orders || []).reduce((s, o) => s + (o.final_amount || 0), 0);
+      const ratingsArr = (ratings || []).map(r => r.rating);
+      const avgRating = ratingsArr.length > 0
+        ? Math.round((ratingsArr.reduce((s, r) => s + r, 0) / ratingsArr.length) * 10) / 10
+        : 0;
+
+      // Determine status: check if suspended in a meta column, default active
+      const status = u.status || 'active';
+
+      return {
+        id: u.id,
+        full_name: u.full_name,
+        phone: u.phone,
+        email: u.email,
+        role: u.role,
+        kyc_verified: !!u.kyc_verified,
+        status,
+        total_orders: totalOrders,
+        total_gmv: totalGmv,
+        avg_rating: avgRating,
+        rating_count: ratingsArr.length,
+        village: isfarmer ? u.location : null,
+        city: !isfarmer ? (u.business_name || u.location) : null,
+        joined_at: u.created_at,
+      };
+    }));
+
+    res.json({ success: true, data: enriched });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, data: [] });
+  }
+});
+
+// PATCH /api/admin/users/:id/status — suspend or reactivate
+app.patch('/api/admin/users/:id/status', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!['active', 'suspended'].includes(status))
+      return res.status(400).json({ error: 'Invalid status' });
+
+    // Store status in users table (add column if missing, gracefully handle)
+    const { error } = await supabase.from('users').update({ status }).eq('id', req.params.id);
+    if (error) throw error;
+
+    res.json({ success: true, status });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/admin/payouts?status=all|failed|kyc_pending|bank_pending
+app.get('/api/admin/payouts', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { status = 'all' } = req.query;
+
+    let query = supabase
+      .from('orders')
+      .select(`
+        id, final_amount, payment_status, created_at, razorpay_payment_id,
+        farmer:users!farmer_id(full_name, phone),
+        trader:users!trader_id(full_name, phone),
+        listing:crop_listings!listing_id(variety),
+        bank:bank_accounts!farmer_id(bank_name, account_number_last4)
+      `)
+      .in('payment_status', ['failed', 'kyc_pending', 'bank_pending', 'processing', 'yet_to_paid', 'not_paid']);
+
+    if (status !== 'all') query = query.eq('payment_status', status);
+
+    const { data, error } = await query.order('created_at', { ascending: true }).limit(100);
+    if (error) throw error;
+
+    const result = (data || []).map(o => ({
+      id: o.id,
+      order_id: o.id,
+      farmer_name: o.farmer?.full_name || 'Unknown',
+      farmer_phone: o.farmer?.phone || '',
+      trader_name: o.trader?.full_name || 'System / Direct',
+      trader_phone: o.trader?.phone || '',
+      crop_name: o.listing?.variety || 'Unknown Crop',
+      final_amount: o.final_amount || 0,
+      payout_amount: Math.round((o.final_amount || 0) * 0.97 * 100) / 100,
+      status: o.payment_status,
+      razorpay_payment_id: o.razorpay_payment_id || null,
+      bank_name: o.bank?.bank_name || null,
+      created_at: o.created_at,
+    }));
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, data: [] });
+  }
+});
+
+// POST /api/admin/payouts/:orderId/pay — manual trigger
+app.post('/api/admin/payouts/:orderId/pay', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    // 1. Fetch order details
+    const { data: order, error: fetchErr } = await supabase
+      .from('orders')
+      .select('id, payment_status, final_amount, farmer_id')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+
+    // 2. Prevent double payment if already paid
+    if (order.payment_status === 'paid') {
+      return res.status(400).json({ error: 'This order has already been paid' });
+    }
+
+    // 3. Update status to 'paid' (In a real app, this would trigger RazorpayX / Payout API)
+    const { error: updateErr } = await supabase
+      .from('orders')
+      .update({ 
+        payment_status: 'paid',
+        status: 'completed', // Finalize order status too
+        updated_at: new Date()
+      })
+      .eq('id', orderId);
+
+    if (updateErr) throw updateErr;
+
+    console.log(`💰 [ADMIN] Manual payout triggered for order ${orderId} by admin ${req.user.id}`);
+
+    res.json({ success: true, message: 'Payout marked as successful' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/admin/disputes — Disputes tab
+app.get('/api/admin/disputes', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { status = 'all' } = req.query;
+
+    let query = supabase
+      .from('order_disputes')
+      .select(`
+        id, order_id, reason, details, status, created_at,
+        order:orders!order_id (
+          final_amount,
+          listing:crop_listings!listing_id(variety),
+          farmer:users!farmer_id(full_name, phone),
+          trader:users!trader_id(full_name, phone)
+        )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (status !== 'all') query = query.eq('status', status);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const result = (data || []).map(d => ({
+      id: d.id,
+      order_id: d.order_id,
+      status: d.status,
+      reason: d.reason,
+      details: d.details,
+      created_at: d.created_at,
+      crop_name: d.order?.listing?.variety || 'Unknown',
+      final_amount: d.order?.final_amount || 0,
+      farmer_name: d.order?.farmer?.full_name || 'System',
+      farmer_phone: d.order?.farmer?.phone || '',
+      trader_name: d.order?.trader?.full_name || 'System',
+      trader_phone: d.order?.trader?.phone || '',
+    }));
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, data: [] });
+  }
+});
+
+// POST /api/admin/disputes/:disputeId/resolve
+app.post('/api/admin/disputes/:disputeId/resolve', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { disputeId } = req.params;
+    const { decision, resolution } = req.body;
+
+    if (!['farmer', 'trader', 'split'].includes(decision)) {
+      return res.status(400).json({ error: 'Invalid decision' });
+    }
+
+    // 1. Update dispute record
+    const { error: disputeErr } = await supabase
+      .from('order_disputes')
+      .update({
+        status: 'resolved',
+        resolution,
+        resolved_by: req.user.id,
+        resolved_at: new Date()
+      })
+      .eq('id', disputeId);
+
+    if (disputeErr) throw disputeErr;
+    
+    console.log(`⚖️ [ADMIN] Dispute ${disputeId} resolved as ${decision} by ${req.user.id}`);
+
+    res.json({ success: true, message: 'Dispute resolved successfully' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/admin/orders — used by adminGetDashboard
+app.get('/api/admin/orders', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('id, status, payment_status, final_amount, created_at, farmer_id, trader_id')
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message, data: [] });
+  }
+});
+
+
+// ==========================================
+// RATINGS & REVIEWS
+// ==========================================
+
+// POST /api/orders/:id/rating — submit a rating after delivery
+app.post('/api/orders/:id/rating', authenticateToken, async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const raterId = req.user.id;
+    const { rating, comment } = req.body;
+
+    if (!rating || rating < 1 || rating > 5)
+      return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+
+    // Fetch order to verify participation and status
+    const { data: order, error: orderErr } = await supabase
+      .from('orders')
+      .select('farmer_id, trader_id, status')
+      .eq('id', orderId)
+      .single();
+
+    if (orderErr || !order) return res.status(404).json({ error: 'Order not found' });
+
+    const isFarmer = raterId === order.farmer_id;
+    const isTrader = raterId === order.trader_id;
+    if (!isFarmer && !isTrader)
+      return res.status(403).json({ error: 'Not a participant of this order' });
+
+    if (!['delivered', 'completed', 'paid'].includes(order.status))
+      return res.status(400).json({ error: 'Can only rate after order is delivered' });
+
+    const rateeId = isFarmer ? order.trader_id : order.farmer_id;
+    const role = isFarmer ? 'farmer' : 'trader';
+
+    const { data, error } = await supabase
+      .from('order_ratings')
+      .upsert([{ order_id: orderId, rater_id: raterId, ratee_id: rateeId, role, rating, comment }],
+        { onConflict: 'order_id,rater_id' })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/users/:id/rating — get avg rating + recent reviews for a profile
+app.get('/api/users/:id/rating', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    const { data: ratings, error } = await supabase
+      .from('order_ratings')
+      .select('rating, comment, role, created_at, rater:users!rater_id(full_name)')
+      .eq('ratee_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) throw error;
+
+    const count = ratings?.length || 0;
+    const avg = count > 0
+      ? Math.round((ratings.reduce((s, r) => s + r.rating, 0) / count) * 10) / 10
+      : null;
+
+    res.json({
+      success: true,
+      avg_rating: avg,
+      total_ratings: count,
+      reviews: (ratings || []).map(r => ({
+        rating: r.rating,
+        comment: r.comment,
+        role: r.role,
+        reviewer_name: r.rater?.full_name || 'Anonymous',
+        created_at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });

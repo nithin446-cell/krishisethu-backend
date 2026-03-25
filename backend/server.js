@@ -1402,11 +1402,10 @@ app.get('/api/admin/payouts', authenticateToken, requireAdmin, async (req, res) 
     let query = supabase
       .from('orders')
       .select(`
-        id, final_amount, payment_status, created_at, razorpay_payment_id,
+        id, final_amount, payment_status, created_at, razorpay_payment_id, farmer_id,
         farmer:users!farmer_id(full_name, phone),
         trader:users!trader_id(full_name, phone),
-        listing:crop_listings!listing_id(variety),
-        bank:bank_accounts!farmer_id(bank_name, account_number_last4)
+        listing:crop_listings!listing_id(variety)
       `)
       .in('payment_status', ['failed', 'kyc_pending', 'bank_pending', 'processing', 'yet_to_paid', 'not_paid']);
 
@@ -1415,21 +1414,37 @@ app.get('/api/admin/payouts', authenticateToken, requireAdmin, async (req, res) 
     const { data, error } = await query.order('created_at', { ascending: true }).limit(100);
     if (error) throw error;
 
-    const result = (data || []).map(o => ({
-      id: o.id,
-      order_id: o.id,
-      farmer_name: o.farmer?.full_name || 'Unknown',
-      farmer_phone: o.farmer?.phone || '',
-      trader_name: o.trader?.full_name || 'System / Direct',
-      trader_phone: o.trader?.phone || '',
-      crop_name: o.listing?.variety || 'Unknown Crop',
-      final_amount: o.final_amount || 0,
-      payout_amount: Math.round((o.final_amount || 0) * 0.97 * 100) / 100,
-      status: o.payment_status,
-      razorpay_payment_id: o.razorpay_payment_id || null,
-      bank_name: o.bank?.bank_name || null,
-      created_at: o.created_at,
-    }));
+    // Fetch bank accounts for all farmers in this batch
+    const farmerIds = [...new Set((data || []).map(o => o.farmer_id))];
+    const { data: banks } = await supabase
+      .from('bank_accounts')
+      .select('user_id, bank_id, account_number')
+      .in('user_id', farmerIds);
+
+    const bankMap = (banks || []).reduce((acc, b) => {
+      acc[b.user_id] = b;
+      return acc;
+    }, {});
+
+    const result = (data || []).map(o => {
+      const bank = bankMap[o.farmer_id];
+      return {
+        id: o.id,
+        order_id: o.id,
+        farmer_name: o.farmer?.full_name || 'Unknown',
+        farmer_phone: o.farmer?.phone || '',
+        trader_name: o.trader?.full_name || 'System / Direct',
+        trader_phone: o.trader?.phone || '',
+        crop_name: o.listing?.variety || 'Unknown Crop',
+        final_amount: o.final_amount || 0,
+        payout_amount: Math.round((o.final_amount || 0) * 0.97 * 100) / 100,
+        status: o.payment_status,
+        razorpay_payment_id: o.razorpay_payment_id || null,
+        bank_name: bank?.bank_id || null, // Mapping bank_id to bank_name for frontend display
+        account_number: bank?.account_number || null,
+        created_at: o.created_at,
+      };
+    });
 
     res.json({ success: true, data: result });
   } catch (err) {

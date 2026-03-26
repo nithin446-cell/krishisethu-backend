@@ -214,15 +214,17 @@ app.get('/api/farmer/orders', authenticateToken, async (req, res) => {
 
 app.get('/api/orders/:id', authenticateToken, async (req, res) => {
   try {
+    const orderId = req.params.id;
     const { data, error } = await req.userSupabase
       .from('orders')
       .select(`
         *,
-        crop_listings(variety, unit, crop_name),
+        crop_listings(variety, unit),
+        bid:bids(amount, quantity),
         farmer:users!farmer_id(full_name, phone, location),
         trader:users!trader_id(full_name, phone, location, business_name)
       `)
-      .eq('id', req.params.id)
+      .eq('id', orderId)
       .single();
 
     if (error || !data) throw new Error(error?.message || 'Order not found');
@@ -232,7 +234,9 @@ app.get('/api/orders/:id', authenticateToken, async (req, res) => {
       ...data,
       crop_name: data.crop_listings?.crop_name || data.crop_listings?.variety || 'Unknown Crop',
       unit: data.crop_listings?.unit || 'kg',
-      farmer_name: data.farmer?.full_name || 'Farmer',
+      agreed_price: data.bid?.amount || 0,
+      quantity: data.bid?.quantity || 0,
+      farmer_name: data.farmer?.full_name || 'Unknown Farmer',
       farmer_phone: data.farmer?.phone || '',
       farmer_village: data.farmer?.location || '',
       trader_name: data.trader?.business_name || data.trader?.full_name || 'Trader',
@@ -243,6 +247,188 @@ app.get('/api/orders/:id', authenticateToken, async (req, res) => {
     res.status(200).json({ success: true, data: formattedData });
   } catch (error) {
     res.status(404).json({ success: false, error: error.message });
+  }
+});
+
+// ==========================================
+// ORDER TRACKING ACTIONS
+// ==========================================
+
+// New Route: Update Status (Confirm/Dispatch)
+app.put('/api/orders/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const { status, dispatch_note, vehicle_number, estimated_days } = req.body;
+    const orderId = req.params.id;
+
+    // Fetch order + parties for authorization and notifications
+    const { data: order, error: fetchErr } = await supabase
+      .from('orders')
+      .select('*, farmer:users!farmer_id(full_name, phone), trader:users!trader_id(full_name, phone)')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchErr || !order) throw new Error('Order not found');
+
+    const isFarmer = req.user.id === order.farmer_id;
+    const isTrader = req.user.id === order.trader_id;
+    if (!isFarmer && !isTrader) return res.status(403).json({ error: 'Unauthorized to update this order' });
+
+    // ── Build new history event ──
+    const newEvent = {
+       status,
+       timestamp: new Date().toISOString(),
+       actor: isFarmer ? 'Farmer' : 'Trader',
+       note: dispatch_note || (status === 'confirmed' ? 'Order accepted by farmer' : `Status updated to ${status}`)
+    };
+
+    const updatedHistory = [...(order.status_history || []), newEvent];
+
+    // ── Prepare update data ──
+    const updateData = {
+      status,
+      status_history: updatedHistory,
+      updated_at: new Date()
+    };
+
+    if (status === 'dispatched') {
+      updateData.dispatched_at = new Date();
+      updateData.dispatch_note = dispatch_note;
+      updateData.vehicle_number = vehicle_number;
+      updateData.estimated_days = parseInt(estimated_days);
+    } else if (status === 'confirmed') {
+      updateData.confirmed_at = new Date();
+    }
+
+    const { error: updateErr } = await supabase.from('orders').update(updateData).eq('id', orderId);
+    if (updateErr) throw updateErr;
+
+    // ── SMS Notifications ──
+    try {
+      const recipientPhone = isFarmer ? order.trader?.phone : order.farmer?.phone;
+      if (recipientPhone) {
+        let msg = `KrishiSethu: Order #${orderId.slice(0, 8)} status updated to ${status}.`;
+        if (status === 'dispatched') {
+          msg = `KrishiSethu: Aapka Order #${orderId.slice(0, 8)} bhej diya gaya hai! Vehicle: ${vehicle_number || 'N/A'}. Track in app.`;
+        } else if (status === 'confirmed') {
+          msg = `KrishiSethu: Farmer ne aapka bid accept kar liya hai! Order #${orderId.slice(0, 8)} confirmed.`;
+        }
+        await sendSMS(recipientPhone, msg);
+      }
+    } catch (smsErr) { console.error('[SMS_ERROR]', smsErr.message); }
+
+    res.json({ success: true, message: `Order status updated to ${status}` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// New Route: Confirm Delivery with Proof
+app.put('/api/orders/:id/deliver', authenticateToken, upload.single('delivery_photo'), async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const { delivery_note } = req.body;
+
+    const { data: order, error: fetchErr } = await supabase
+      .from('orders')
+      .select('*, farmer:users!farmer_id(full_name, phone)')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchErr || !order) throw new Error('Order not found');
+    if (req.user.id !== order.trader_id) return res.status(403).json({ error: 'Only the trader can confirm delivery' });
+
+    let photoUrl = null;
+    if (req.file) {
+      try {
+        const fileName = `delivery-${orderId}-${Date.now()}${path.extname(req.file.originalname)}`;
+        await s3Client.send(new PutObjectCommand({ 
+          Bucket: 'order-photos', 
+          Key: fileName, 
+          Body: fs.readFileSync(req.file.path), 
+          ContentType: req.file.mimetype 
+        }));
+        const { data: publicUrlData } = supabase.storage.from('order-photos').getPublicUrl(fileName);
+        photoUrl = publicUrlData.publicUrl;
+        fs.unlinkSync(req.file.path);
+      } catch (s3Err) {
+        console.error('[S3_UPLOAD_ERROR]', s3Err);
+        // Continue without photo if upload fails, but log it
+      }
+    }
+
+    const newEvent = {
+      status: 'delivered',
+      timestamp: new Date().toISOString(),
+      actor: 'Trader',
+      note: delivery_note || 'Delivery confirmed by trader'
+    };
+
+    const { error: updateErr } = await supabase.from('orders').update({
+      status: 'delivered',
+      payment_status: 'processing', // Ready for release
+      delivered_at: new Date(),
+      delivery_note,
+      delivery_photo_url: photoUrl,
+      status_history: [...(order.status_history || []), newEvent],
+      updated_at: new Date()
+    }).eq('id', orderId);
+
+    if (updateErr) throw updateErr;
+
+    // 📱 SMS to Farmer: Delivery confirmed, money incoming
+    if (order.farmer?.phone) {
+      await sendSMS(order.farmer.phone, `KrishiSethu: Saman mil gaya! Trader ne delivery confirm kar di hai. Payment release ho raha hai.`);
+    }
+
+    res.json({ success: true, message: 'Delivery confirmed successfully!' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// New Route: Raise Issue/Dispute
+app.post('/api/orders/:id/dispute', authenticateToken, async (req, res) => {
+  try {
+    const orderId = req.params.id;
+    const { reason, details } = req.body;
+
+    const { data: order, error: fetchErr } = await supabase.from('orders').select('*').eq('id', orderId).single();
+    if (fetchErr || !order) throw new Error('Order not found');
+
+    const isParty = req.user.id === order.farmer_id || req.user.id === order.trader_id;
+    if (!isParty) return res.status(403).json({ error: 'Unauthorized party' });
+
+    // 1. Create entry in disputes table
+    const { error: disputeErr } = await supabase.from('order_disputes').insert([{
+      order_id: orderId,
+      raised_by: req.user.id,
+      reason,
+      details,
+      status: 'open'
+    }]);
+    if (disputeErr) throw disputeErr;
+
+    // 2. Mark order as disputed
+    const newEvent = {
+      status: 'disputed',
+      timestamp: new Date().toISOString(),
+      actor: req.user.id === order.farmer_id ? 'Farmer' : 'Trader',
+      note: `Dispute raised: ${reason}`
+    };
+
+    await supabase.from('orders').update({
+      status: 'disputed',
+      dispute_reason: reason,
+      dispute_details: details,
+      disputed_by: req.user.id,
+      disputed_at: new Date(),
+      status_history: [...(order.status_history || []), newEvent],
+      updated_at: new Date()
+    }).eq('id', orderId);
+
+    res.json({ success: true, message: 'Dispute submitted. We will investigate.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

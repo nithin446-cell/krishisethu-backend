@@ -1,21 +1,23 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const { createClient } = require('@supabase/supabase-js');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
-const Razorpay = require('razorpay');
-const crypto = require('crypto');
-const FormData = require('form-data');
-const axios = require('axios');
 
 // Load env based on NODE_ENV: .env.production in prod, .env.development in dev
 const envFile = process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development';
 dotenv.config({ path: `${__dirname}/${envFile}` });
 // Fallback to plain .env if specific file doesn't exist
 dotenv.config({ path: `${__dirname}/.env` });
+
+const { createClient } = require('@supabase/supabase-js');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const multer = require('multer');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
+const FormData = require('form-data');
+const axios = require('axios');
+const { sendPushNotification } = require('./notificationHelper');
 
 const app = express();
 app.use(cors());
@@ -316,6 +318,18 @@ app.put('/api/orders/:id/status', authenticateToken, async (req, res) => {
       }
     } catch (smsErr) { console.error('[SMS_ERROR]', smsErr.message); }
 
+    // ── FCM Notifications ──
+    try {
+      const isTrader = req.user.id === order.trader_id;
+      const targetUserId = isTrader ? order.farmer_id : order.trader_id;
+      const title = status === 'dispatched' ? 'Mal Bhej Diya Gaya!' : 'Order Status Update';
+      const body = status === 'dispatched' 
+        ? `KrishiSethu: Order #${orderId.slice(0, 8)} dispatched. Vehicle: ${vehicle_number || 'N/A'}`
+        : `KrishiSethu: Aapka Order #${orderId.slice(0, 8)} ab ${status} hai.`;
+      
+      await sendPushNotification(targetUserId, { title, body, data: { order_id: orderId, type: 'ORDER_UPDATE' } });
+    } catch (fcmErr) { console.error('[FCM_ERROR]', fcmErr.message); }
+
     res.json({ success: true, message: `Order status updated to ${status}` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -380,6 +394,13 @@ app.put('/api/orders/:id/deliver', authenticateToken, upload.single('delivery_ph
       await sendSMS(order.farmer.phone, `KrishiSethu: Saman mil gaya! Trader ne delivery confirm kar di hai. Payment release ho raha hai.`);
     }
 
+    // ── FCM Notification ──
+    await sendPushNotification(order.farmer_id, {
+      title: 'Mal Mil Gaya!',
+      body: 'Trader ne delivery confirm kar di hai. Payment release ho raha hai.',
+      data: { order_id: orderId, type: 'DELIVERY_CONFIRMED' }
+    });
+
     res.json({ success: true, message: 'Delivery confirmed successfully!' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -425,6 +446,16 @@ app.post('/api/orders/:id/dispute', authenticateToken, async (req, res) => {
       status_history: [...(order.status_history || []), newEvent],
       updated_at: new Date()
     }).eq('id', orderId);
+
+    // ── FCM Notification ──
+    try {
+      const targetUserId = req.user.id === order.farmer_id ? order.trader_id : order.farmer_id;
+      await sendPushNotification(targetUserId, {
+        title: 'Dispute Raised',
+        body: `KrishiSethu: Order #${orderId.slice(0, 8)} par dispute raise kiya gaya hai: ${reason}`,
+        data: { order_id: orderId, type: 'DISPUTE_RAISED' }
+      });
+    } catch (fcmErr) { console.error('[FCM] Dispute notification failed:', fcmErr.message); }
 
     res.json({ success: true, message: 'Dispute submitted. We will investigate.' });
   } catch (err) {
@@ -510,6 +541,15 @@ app.put('/api/farmer/order/:id/confirm-payment', authenticateToken, async (req, 
       console.error('[SMS] Payout notification failed:', smsErr.message);
     }
 
+    // ── FCM Notification ──
+    await sendPushNotification(farmerId, {
+      title: 'Payment Released!',
+      body: payoutResult 
+        ? `KrishiSethu: Aapka payment transfer kar diya gaya hai. Ref: ${payoutResult.id?.slice(0, 8)}`
+        : `KrishiSethu: Delivery confirmed. Payment processing me hai.`,
+      data: { order_id: orderId, type: 'PAYMENT_RELEASED' }
+    });
+
     res.json({
       success: true,
       message: payoutResult
@@ -542,6 +582,13 @@ app.put('/api/farmer/bid/:id/accept', authenticateToken, async (req, res) => {
         if (trader?.phone) {
           await sendSMS(trader.phone, `KrishiSethu: ${farmer?.full_name || 'Farmer'} ne aapka ₹${bid.amount}/kg bid accept kar liya. App me order dekhe aur payment karein.`);
         }
+
+        // ── FCM Notification ──
+        await sendPushNotification(bid.trader_id, {
+          title: 'Bid Accepted!',
+          body: `KrishiSethu: ${farmer?.full_name || 'Farmer'} ne aapka ₹${bid.amount}/kg bid accept kar liya. Ab payment karein.`,
+          data: { bid_id: req.params.id, type: 'BID_ACCEPTED' }
+        });
       }
     } catch (smsErr) {
       console.error('[SMS] Bid-accept notification failed:', smsErr.message);
@@ -591,6 +638,13 @@ app.post('/api/trader/bid', authenticateToken, async (req, res) => {
           const traderName = req.user.user_metadata?.full_name || 'A trader';
           await sendSMS(farmer.phone, `KrishiSethu: ${traderName} ne aapki fasal par ₹${amount}/kg ka bid lagaya hai. App me dekhein.`);
         }
+
+        // ── FCM Notification ──
+        await sendPushNotification(listing.farmer_id, {
+          title: 'New Bid Received!',
+          body: `${req.user.user_metadata?.full_name || 'A trader'} ne aapkia fasal par ₹${amount}/kg ka bid lagaya hai.`,
+          data: { listing_id, type: 'NEW_BID' }
+        });
       }
     } catch (smsErr) {
       console.error('[SMS] Bid notification failed:', smsErr.message);

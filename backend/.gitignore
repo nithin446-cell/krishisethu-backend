@@ -3,3 +3,5 @@
 .env.production
 .env.example
 uploads/
+firebase-service-account.json
+debug.log

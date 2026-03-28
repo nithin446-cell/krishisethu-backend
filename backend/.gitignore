@@ -1,7 +1,8 @@
 .env
-.env.development
-.env.production
-.env.example
+.env.*
+.env.local
 uploads/
-firebase-service-account.json
+*.json
+!package.json
+!package-lock.json
 debug.log

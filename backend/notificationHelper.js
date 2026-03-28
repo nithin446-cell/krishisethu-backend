@@ -1,15 +1,23 @@
 const admin = require('firebase-admin');
 const { createClient } = require('@supabase/supabase-js');
 
-// 💡 This is a placeholder. User MUST put their firebase-service-account.json in the backend folder.
-let serviceAccount;
+let serviceAccount = null;
 try {
-  serviceAccount = require('./firebase-service-account.json');
+  const saRaw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (saRaw) {
+    serviceAccount = JSON.parse(saRaw);
+  } else {
+    // Fallback search in root (deprecated)
+    const saPath = require('path').join(__dirname, 'firebase-service-account.json');
+    if (require('fs').existsSync(saPath)) {
+      serviceAccount = require(saPath);
+    }
+  }
 } catch (e) {
-  console.warn('[FCM] firebase-service-account.json not found. Push notifications will be disabled.');
+  console.warn('[FCM] Firebase Service Account configuration missing or invalid. Push notifications will be disabled.');
 }
 
-if (serviceAccount) {
+if (serviceAccount && !admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });

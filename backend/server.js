@@ -1,22 +1,40 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development') });
+require('dotenv').config({ path: path.join(__dirname, '.env') }); // Fallback to .env
+
 const express = require('express');
 const expressWs = require('express-ws');
 const cors = require('cors');
 const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { supabase: adminSupabase } = require('./config/supabase');
 
 // Initialize Express with WebSocket support
 const app = express();
 expressWs(app);
 
-// --- Global Midleware ---
-app.use(helmet()); // Security headers
+// --- Rate Limiting ---
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300,
+  message: { success: false, error: 'Too many requests. Please try again later.' },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { success: false, error: 'Too many auth attempts. Please try again later.' },
+});
+
+// --- Global Middleware ---
+app.use(helmet());
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*', methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use(globalLimiter);
 
 // --- Modular Routes ---
-app.use('/api/auth', require('./routes/auth'));
+app.use('/api/auth', authLimiter, require('./routes/auth'));
 app.use('/api/user', require('./routes/auth')); // Reusing for profile routes
 app.use('/api/market', require('./routes/market'));
 app.use('/api/farmer', require('./routes/farmer'));

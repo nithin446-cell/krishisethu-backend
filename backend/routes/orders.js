@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { supabase: adminSupabase } = require('../config/supabase');
+const { supabase: adminSupabase, BUCKETS } = require('../config/supabase');
 const { authenticateToken } = require('../middleware/auth');
 const { sendSMS, sendPushNotification } = require('../utils/notifications');
 
@@ -154,8 +154,8 @@ router.put('/:id/deliver', authenticateToken, upload.single('delivery_photo'), a
     let photoUrl = null;
     if (req.file) {
       const fileName = `delivery-${orderId}-${Date.now()}${path.extname(req.file.originalname)}`;
-      await s3Client.send(new PutObjectCommand({ Bucket: 'order-photos', Key: fileName, Body: fs.readFileSync(req.file.path), ContentType: req.file.mimetype }));
-      const { data: publicUrlData } = adminSupabase.storage.from('order-photos').getPublicUrl(fileName);
+      await s3Client.send(new PutObjectCommand({ Bucket: BUCKETS.ORDER_PHOTOS, Key: fileName, Body: fs.readFileSync(req.file.path), ContentType: req.file.mimetype }));
+      const { data: publicUrlData } = adminSupabase.storage.from(BUCKETS.ORDER_PHOTOS).getPublicUrl(fileName);
       photoUrl = publicUrlData.publicUrl;
       fs.unlinkSync(req.file.path);
     }

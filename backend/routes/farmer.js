@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { supabase: adminSupabase } = require('../config/supabase');
+const { supabase: adminSupabase, BUCKETS } = require('../config/supabase');
 const { authenticateToken } = require('../middleware/auth');
 
 // Multer and S3 setup for Farmer uploads
@@ -54,13 +54,13 @@ router.post('/upload', authenticateToken, upload.array('images', 5), async (req,
         const fileName = `${listingData.id}-${Date.now()}${path.extname(file.originalname)}`;
         try {
           await s3Client.send(new PutObjectCommand({
-            Bucket: 'crop_pictures',
+            Bucket: BUCKETS.CROP_PICTURES,
             Key: `${farmer_id}/${fileName}`,
             Body: fs.readFileSync(file.path),
             ContentType: file.mimetype
           }));
           
-          const { data: publicUrlData } = adminSupabase.storage.from('crop_pictures').getPublicUrl(`${farmer_id}/${fileName}`);
+          const { data: publicUrlData } = adminSupabase.storage.from(BUCKETS.CROP_PICTURES).getPublicUrl(`${farmer_id}/${fileName}`);
           
           await req.userSupabase.from('crop_pictures').insert([{
             listing_id: listingData.id,
@@ -131,8 +131,8 @@ router.post('/kyc', authenticateToken, upload.array('documents', 5), async (req,
     const uploadedUrls = [];
     for (const file of req.files) {
       const fileName = `kyc-${userId}-${Date.now()}${path.extname(file.originalname)}`;
-      await s3Client.send(new PutObjectCommand({ Bucket: 'user_documents', Key: fileName, Body: fs.readFileSync(file.path), ContentType: file.mimetype }));
-      const { data: publicUrlData } = adminSupabase.storage.from('user_documents').getPublicUrl(fileName);
+      await s3Client.send(new PutObjectCommand({ Bucket: BUCKETS.USER_DOCUMENTS, Key: fileName, Body: fs.readFileSync(file.path), ContentType: file.mimetype }));
+      const { data: publicUrlData } = adminSupabase.storage.from(BUCKETS.USER_DOCUMENTS).getPublicUrl(fileName);
       uploadedUrls.push(publicUrlData.publicUrl);
       fs.unlinkSync(file.path);
     }
@@ -150,3 +150,5 @@ router.post('/kyc', authenticateToken, upload.array('documents', 5), async (req,
     res.status(500).json({ error: error.message });
   }
 });
+
+module.exports = router;

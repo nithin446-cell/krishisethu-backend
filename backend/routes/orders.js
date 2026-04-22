@@ -28,19 +28,27 @@ const s3Client = new S3Client({
  */
 router.get('/:id', authenticateToken, async (req, res) => {
   try {
+    // Step 1: Fetch the order row + crop/bid info (no user joins to avoid Supabase double-alias bug)
     const { data, error } = await req.userSupabase
       .from('orders')
       .select(`
         *,
         crop_listings(variety, unit),
-        bid:bids(amount, quantity),
-        farmer:users!farmer_id(full_name, phone, location),
-        trader:users!trader_id(full_name, phone, location, business_name)
+        bid:bids(amount, quantity)
       `)
       .eq('id', req.params.id)
       .single();
 
     if (error || !data) throw new Error(error?.message || 'Order not found');
+
+    // Step 2: Fetch farmer and trader separately to guarantee correct user data
+    const [farmerResult, traderResult] = await Promise.all([
+      adminSupabase.from('users').select('full_name, phone, location').eq('id', data.farmer_id).single(),
+      adminSupabase.from('users').select('full_name, phone, location, business_name').eq('id', data.trader_id).single()
+    ]);
+
+    const farmer = farmerResult.data;
+    const trader = traderResult.data;
 
     // Format for frontend component compatibility
     const formattedData = {
@@ -49,10 +57,12 @@ router.get('/:id', authenticateToken, async (req, res) => {
       unit: data.crop_listings?.unit || 'kg',
       agreed_price: data.bid?.amount || 0,
       quantity: data.bid?.quantity || 0,
-      farmer_name: data.farmer?.full_name || 'Unknown Farmer',
-      farmer_phone: data.farmer?.phone || '',
-      trader_name: data.trader?.business_name || data.trader?.full_name || 'Trader',
-      trader_phone: data.trader?.phone || ''
+      farmer_name: farmer?.full_name || 'Unknown Farmer',
+      farmer_phone: farmer?.phone || '',
+      farmer_village: farmer?.location || '',
+      trader_name: trader?.business_name || trader?.full_name || 'Unknown Trader',
+      trader_phone: trader?.phone || '',
+      trader_city: trader?.location || ''
     };
 
     res.status(200).json({ success: true, data: formattedData });
@@ -160,11 +170,20 @@ router.put('/:id/deliver', authenticateToken, upload.single('delivery_photo'), a
       fs.unlinkSync(req.file.path);
     }
 
+    const newEvent = {
+      status: 'delivered',
+      timestamp: new Date().toISOString(),
+      actor: 'Trader',
+      note: delivery_note || 'Trader confirmed delivery of goods'
+    };
+
     await adminSupabase.from('orders').update({
       status: 'delivered',
       payment_status: 'processing',
       delivered_at: new Date(),
       delivery_photo_url: photoUrl,
+      delivery_note: delivery_note || null,
+      status_history: [...(order.status_history || []), newEvent],
       updated_at: new Date()
     }).eq('id', orderId);
 
@@ -196,6 +215,48 @@ router.post('/:id/dispute', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Dispute submitted successfully.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/orders/:id/rating
+ * Submit rating and feedback for an order.
+ */
+router.post('/:id/rating', authenticateToken, async (req, res) => {
+  try {
+    const { rating, note } = req.body;
+    const orderId = req.params.id;
+
+    const { data: order, error: fetchErr } = await adminSupabase
+      .from('orders')
+      .select('status_history')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchErr || !order) throw new Error('Order not found');
+
+    const newEvent = {
+      status: 'rated',
+      timestamp: new Date().toISOString(),
+      actor: 'System',
+      note: `User rated this transaction ${rating} stars: ${note || 'No comment'}`
+    };
+
+    const { error: updateErr } = await adminSupabase
+      .from('orders')
+      .update({
+        rating: rating,
+        rating_note: note,
+        status_history: [...(order.status_history || []), newEvent],
+        updated_at: new Date()
+      })
+      .eq('id', orderId);
+
+    if (updateErr) throw updateErr;
+
+    res.json({ success: true, message: 'Rating submitted successfully!' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

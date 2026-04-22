@@ -363,7 +363,7 @@ router.post('/payouts/:orderId/pay', authenticateToken, requireAdmin, async (req
     if (order.payment_status === 'paid') return res.status(400).json({ error: 'This order has already been paid' });
 
     const { error: updateErr } = await adminSupabase.from('orders').update({
-      payment_status: 'paid', status: 'completed', updated_at: new Date()
+      payment_status: 'paid', status: 'paid', paid_at: new Date(), updated_at: new Date()
     }).eq('id', orderId);
 
     if (updateErr) throw updateErr;

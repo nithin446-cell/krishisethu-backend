@@ -58,16 +58,17 @@ router.post('/bid', authenticateToken, async (req, res) => {
  */
 router.get('/bids', authenticateToken, async (req, res) => {
   try {
-    const { data, error } = await req.userSupabase
+    const { data, error } = await adminSupabase
       .from('bids')
       .select(`*, crop_listings (variety, current_price, status)`)
       .eq('trader_id', req.user.id)
       .order('created_at', { ascending: false });
       
     if (error) throw error;
-    res.status(200).json(data);
+    res.status(200).json({ success: true, data });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('[TRADER_BIDS_ERROR]', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -77,15 +78,21 @@ router.get('/bids', authenticateToken, async (req, res) => {
  */
 router.get('/orders', authenticateToken, async (req, res) => {
   try {
-    const { data, error } = await req.userSupabase
+    const { data, error } = await adminSupabase
       .from('orders')
-      .select(`*, crop_listings (variety, unit, location), farmer:users!farmer_id (full_name, phone), bids (quantity)`)
+      .select(`
+        *,
+        crop_listings (variety, unit, location),
+        farmer:users!farmer_id (full_name, phone),
+        bids (quantity)
+      `)
       .eq('trader_id', req.user.id)
       .order('created_at', { ascending: false });
       
     if (error) throw error;
     res.status(200).json({ success: true, data });
   } catch (error) {
+    console.error('[TRADER_ORDERS_ERROR]', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });

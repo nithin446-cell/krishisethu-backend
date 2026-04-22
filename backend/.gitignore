@@ -6,3 +6,10 @@ uploads/
 !package.json
 !package-lock.json
 debug.log
+backend/.env.production
+backend/.env.development
+.env*
+.env
+.env.development
+.env.production
+.env.*

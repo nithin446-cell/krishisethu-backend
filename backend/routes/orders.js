@@ -33,7 +33,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
       .from('orders')
       .select(`
         *,
-        crop_listings(variety, unit),
+        crop_listings(variety, unit, crop_pictures(image_url)),
         bid:bids(amount, quantity)
       `)
       .eq('id', req.params.id)
@@ -57,6 +57,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
       unit: data.crop_listings?.unit || 'kg',
       agreed_price: data.bid?.amount || 0,
       quantity: data.bid?.quantity || 0,
+      produce_image_url: data.crop_listings?.crop_pictures?.[0]?.image_url || null,
       farmer_name: farmer?.full_name || 'Unknown Farmer',
       farmer_phone: farmer?.phone || '',
       farmer_village: farmer?.location || '',

@@ -66,12 +66,41 @@ router.get('/orders', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { data, error } = await adminSupabase
       .from('orders')
-      .select('id, status, payment_status, final_amount, created_at, farmer_id, trader_id')
+      .select(`
+        id, status, payment_status, final_amount, created_at, delivery_photo_url,
+        farmer:users!farmer_id(full_name),
+        trader:users!trader_id(full_name, business_name),
+        crop_listings(variety, unit, crop_pictures(image_url)),
+        bid:bids(amount, quantity)
+      `)
       .order('created_at', { ascending: false })
       .limit(500);
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
+      
+    if (error) {
+      console.error('[ADMIN_ORDERS_DB_ERROR]', error);
+      throw error;
+    }
+
+    const result = (data || []).map(o => ({
+      id: o.id,
+      status: o.status,
+      payment_status: o.payment_status,
+      final_amount: o.final_amount,
+      quantity: o.bid?.quantity || 0,
+      unit: o.crop_listings?.unit || 'unit',
+      agreed_price: o.bid?.amount || 0,
+      created_at: o.created_at,
+      delivery_photo_url: o.delivery_photo_url,
+      produce_image_url: o.crop_listings?.crop_pictures?.[0]?.image_url || null,
+      farmer_name: o.farmer?.full_name || 'Unknown',
+      trader_name: o.trader?.business_name || o.trader?.full_name || 'Unknown',
+      crop_name: o.crop_listings?.variety || 'Unknown Crop',
+      listing_title: '' 
+    }));
+
+    res.json({ success: true, data: result });
   } catch (err) {
+    console.error('[ADMIN_ORDERS_ERROR]', err.message);
     res.status(500).json({ success: false, error: err.message, data: [] });
   }
 });

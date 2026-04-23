@@ -406,17 +406,21 @@ router.get('/payouts', authenticateToken, requireAdmin, async (req, res) => {
 
     const result = (data || []).map(o => {
       const bank = bankMap[o.farmer_id];
+      // Payout amount is usually final_amount minus platform commission (3%)
+      const payoutAmount = (Number(o.final_amount) || 0) * 0.97;
+      
       return {
         id: o.id, 
         order_id: o.id,
-        payment_status: o.payment_status,
+        status: o.payment_status || 'pending', // Frontend expects 'status'
         final_amount: o.final_amount,
+        payout_amount: payoutAmount, // Frontend expects 'payout_amount'
         farmer_name: o.farmer?.full_name || 'Unknown', 
         farmer_phone: o.farmer?.phone || '',
         trader_name: o.trader?.full_name || 'System', 
         trader_phone: o.trader?.phone || '',
         crop_name: o.listing?.variety || o.crop_listings?.variety || 'Unknown Crop',
-        bank_details: bank ? `${bank.bank_id} - ${bank.account_number}` : 'No bank linked',
+        bank_name: bank ? `${bank.bank_id} - ${bank.account_number}` : null, // Frontend expects 'bank_name'
         razorpay_payment_id: o.razorpay_payment_id || null,
         created_at: o.created_at,
       };

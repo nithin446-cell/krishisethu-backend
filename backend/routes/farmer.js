@@ -184,28 +184,45 @@ router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
     const { bidId } = req.params;
     const { listing_id } = req.body;
     
-    // 1. Fetch Bid
-    const { data: bid, error: bidErr } = await req.userSupabase
+    console.log(`[BID_ACCEPT] Starting acceptance for Bid: ${bidId}, Listing: ${listing_id}`);
+
+    // 1. Fetch Bid (using adminSupabase to ensure we see it regardless of RLS)
+    const { data: bid, error: bidErr } = await adminSupabase
       .from('bids')
       .select('trader_id, amount, quantity, status')
       .eq('id', bidId)
       .single();
       
-    if (bidErr || !bid) throw new Error('Bid not found');
+    if (bidErr || !bid) {
+      console.error('[BID_ACCEPT] Bid not found:', bidErr?.message);
+      throw new Error('Bid not found');
+    }
 
     // 2. Fetch Listing to ensure ownership
-    const { data: listing, error: listingErr } = await req.userSupabase
+    const { data: listing, error: listingErr } = await adminSupabase
       .from('crop_listings')
       .select('farmer_id, status, variety')
       .eq('id', listing_id)
       .single();
       
-    if (listingErr || !listing) throw new Error('Listing not found');
-    if (listing.farmer_id !== req.user.id) throw new Error('Unauthorized to accept this bid');
+    if (listingErr || !listing) {
+      console.error('[BID_ACCEPT] Listing not found:', listingErr?.message);
+      throw new Error('Listing not found');
+    }
+    
+    if (listing.farmer_id !== req.user.id) {
+      console.warn(`[BID_ACCEPT] Unauthorized: Farmer ${req.user.id} tried to accept bid on listing owned by ${listing.farmer_id}`);
+      throw new Error('Unauthorized to accept this bid');
+    }
 
-    // 3. RECOVERY: If bid is already accepted, check if order already exists.
-    //    If order exists → return success (fully idempotent).
-    //    If no order yet → fall through to create it (recover from prior failure).
+    // 3. Verify Trader Exists (Recovery for deleted users)
+    const { data: traderCheck } = await adminSupabase.from('users').select('id').eq('id', bid.trader_id).single();
+    if (!traderCheck) {
+      console.error(`[BID_ACCEPT] Trader ${bid.trader_id} no longer exists in users table.`);
+      throw new Error('The trader for this bid no longer has an active account.');
+    }
+
+    // 4. RECOVERY: If bid is already accepted, check if order already exists.
     if (bid.status === 'accepted') {
       const { data: existingOrder } = await adminSupabase
         .from('orders')
@@ -216,17 +233,16 @@ router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
       if (existingOrder) {
         return res.json({ success: true, message: 'Bid already accepted', data: existingOrder });
       }
-      // No order yet — skip bid/listing updates, jump to order creation below
     } else {
-      // Normal path: bid is still pending
-      const { error: updBidErr } = await req.userSupabase
+      // Normal path: Update bid status using adminSupabase to bypass any RLS edge cases
+      const { error: updBidErr } = await adminSupabase
         .from('bids')
         .update({ status: 'accepted' })
         .eq('id', bidId);
       if (updBidErr) throw updBidErr;
 
       // Reject all other pending bids for this listing
-      await req.userSupabase
+      await adminSupabase
         .from('bids')
         .update({ status: 'rejected' })
         .eq('listing_id', listing_id)
@@ -234,14 +250,15 @@ router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
         .eq('status', 'pending');
 
       // Mark listing as sold
-      await req.userSupabase
+      await adminSupabase
         .from('crop_listings')
         .update({ status: 'sold' })
         .eq('id', listing_id);
     }
 
-    // 4. Create the Order (adminSupabase bypasses RLS — farmer inserts but policy checks trader_id)
+    // 5. Create the Order
     const final_amount = bid.amount * bid.quantity;
+    console.log(`[BID_ACCEPT] Creating order for Farmer: ${req.user.id}, Trader: ${bid.trader_id}, Amount: ${final_amount}`);
     
     const { data: order, error: orderErr } = await adminSupabase
       .from('orders')
@@ -253,17 +270,26 @@ router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
         final_amount: final_amount,
         status: 'confirmed',
         payment_status: 'pending',
-        status_history: [{ status: 'confirmed', timestamp: new Date().toISOString(), actor: 'Farmer', note: 'Order created upon bid acceptance' }]
+        status_history: [{ 
+          status: 'confirmed', 
+          timestamp: new Date().toISOString(), 
+          actor: 'Farmer', 
+          note: 'Order created upon bid acceptance' 
+        }]
       }])
       .select().single();
       
-    if (orderErr) throw orderErr;
+    if (orderErr) {
+      console.error('[BID_ACCEPT] Order insertion failed:', orderErr.message);
+      throw orderErr;
+    }
 
-    // 7. Notify Trader
+    // 6. Notify Trader
     const { data: trader } = await adminSupabase.from('users').select('phone').eq('id', bid.trader_id).single();
     if (trader?.phone) {
       await sendSMS(trader.phone, `KrishiSethu: Badhai ho! Farmer ne aapka ₹${bid.amount} ka bid accept kar liya hai. Aapki order tracking start ho gayi hai.`);
     }
+    
     try {
       await sendPushNotification(bid.trader_id, {
         title: 'Bid Accepted! 🎉',
@@ -271,11 +297,13 @@ router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
         data: { order_id: order.id, type: 'BID_ACCEPTED' }
       });
     } catch (e) {
-      // silent fail
+      console.warn('[BID_ACCEPT] Push notification failed:', e.message);
     }
 
+    console.log(`[BID_ACCEPT] Success! Order ID: ${order.id}`);
     res.json({ success: true, message: 'Bid accepted successfully', data: order });
   } catch (error) {
+    console.error('[BID_ACCEPT_EXCEPTION]', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });

@@ -77,12 +77,26 @@ router.post('/verify', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid signature.' });
     }
 
-    await adminSupabase.from('orders').update({
-      status: 'completed',
+    // 1. Update Order Status
+    const { error: updateErr } = await adminSupabase.from('orders').update({
       payment_status: 'processing',
-      razorpay_payment_id,
-      updated_at: new Date()
+      razorpay_payment_id
     }).eq('id', order_id);
+
+    if (updateErr) {
+      if (updateErr.code === '23505') { // Unique constraint violation
+        return res.status(200).json({ success: true, message: 'Payment already processed.' });
+      }
+      throw updateErr;
+    }
+
+    // 2. Atomic History Append
+    await adminSupabase.rpc('append_order_history', {
+      p_order_id: order_id,
+      p_status: 'completed',
+      p_note: `Payment verified: ${razorpay_payment_id}`,
+      p_actor: 'System'
+    });
 
     res.status(200).json({ success: true, message: 'Payment verified!' });
   } catch (error) {
@@ -106,11 +120,21 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     const event = JSON.parse(req.body);
     if (event.event === 'payment.captured') {
       const orderId = event.payload.payment.entity.receipt;
-      await adminSupabase.from('orders').update({ 
+      const paymentId = event.payload.payment.entity.id;
+
+      const { error: updateErr } = await adminSupabase.from('orders').update({ 
         payment_status: 'processing', 
-        status: 'completed', 
-        updated_at: new Date() 
+        razorpay_payment_id: paymentId
       }).eq('id', orderId);
+
+      if (!updateErr) {
+        await adminSupabase.rpc('append_order_history', {
+          p_order_id: orderId,
+          p_status: 'completed',
+          p_note: `Payment captured via webhook: ${paymentId}`,
+          p_actor: 'System'
+        });
+      }
     }
     res.json({ received: true });
   } catch (error) {

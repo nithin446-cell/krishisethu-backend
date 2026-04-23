@@ -34,16 +34,32 @@ router.post('/signup', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Unauthorized: Cannot create admin accounts via public signup.' });
     }
 
-    const { data: authData, error: authError } = await adminSupabase.auth.signUp({ email, password });
+    // 1. Sign up with Supabase Auth including all metadata
+    const { data: authData, error: authError } = await adminSupabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: {
+          full_name,
+          role,
+          phone,
+          location,
+          business_name
+        }
+      }
+    });
+
     if (authError) throw authError;
 
-    const { data: userData, error: userError } = await adminSupabase.from('users').insert([{
-      id: authData.user.id, role, full_name, phone, email, location, business_name
-    }]).select().single();
-    
-    if (userError) throw userError;
+    // 🛑 Note: The public.users profile is now automatically created by a 
+    // Postgres trigger (handle_new_user) to ensure data integrity.
 
-    res.status(201).json({ success: true, message: 'Account created', user: userData, session: authData.session });
+    res.status(201).json({ 
+      success: true, 
+      message: 'Account created successfully', 
+      user: authData.user, 
+      session: authData.session 
+    });
   } catch (error) {
     res.status(400).json({ success: false, error: error.message });
   }

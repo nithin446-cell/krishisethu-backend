@@ -8,6 +8,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { supabase: adminSupabase } = require('./config/supabase');
+const { authenticateToken } = require('./middleware/auth');
 
 // Initialize Express with WebSocket support
 const app = express();
@@ -45,6 +46,25 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/bank', require('./routes/bank'));
 app.use('/api/mandi', require('./routes/mandi'));
 app.use('/api/chat', require('./routes/chat'));
+
+// --- NEW: Public/Shared Data Routes ---
+app.get('/api/schemes', authenticateToken, async (req, res) => {
+  // Simple fetch from users for now or mock
+  res.json([]);
+});
+
+app.get('/api/traders', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from('users')
+      .select('id, full_name, business_name, location, phone')
+      .eq('role', 'trader');
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // --- Secure WebSocket Implementation ---
 const chatRooms = {};
@@ -140,3 +160,4 @@ const port = process.env.PORT || 10000;
 app.listen(port, () => {
   console.log(`🚀 KrishiSethu Backend Running on port ${port} [${process.env.NODE_ENV}]`);
 });
+ 

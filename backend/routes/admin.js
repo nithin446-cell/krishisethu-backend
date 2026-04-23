@@ -282,7 +282,7 @@ router.get('/users', authenticateToken, requireAdmin, async (req, res) => {
     const { search = '', role = 'all' } = req.query;
     let query = adminSupabase
       .from('users')
-      .select('id, full_name, phone, email, role, kyc_verified, location, business_name, created_at, status');
+      .select('id, full_name, phone, email, role, kyc_verified, location, business_name, created_at, status, verification_status');
 
     if (role !== 'all') query = query.eq('role', role);
     if (search) query = query.or(`full_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
@@ -290,31 +290,41 @@ router.get('/users', authenticateToken, requireAdmin, async (req, res) => {
     const { data: users, error } = await query.order('created_at', { ascending: false }).limit(200);
     if (error) throw error;
 
-    // Enrich with order stats
-    const enriched = await Promise.all((users || []).map(async (u) => {
-      const isfarmer = u.role === 'farmer';
-      const col = isfarmer ? 'farmer_id' : 'trader_id';
-      const [{ data: orders }, { data: ratings }] = await Promise.all([
-        adminSupabase.from('orders').select('id, final_amount, status').eq(col, u.id),
-        adminSupabase.from('order_ratings').select('rating').eq('ratee_id', u.id),
-      ]);
-      const totalGmv = (orders || []).reduce((s, o) => s + (o.final_amount || 0), 0);
-      const ratingsArr = (ratings || []).map(r => r.rating);
-      const avgRating = ratingsArr.length > 0
-        ? Math.round((ratingsArr.reduce((s, r) => s + r, 0) / ratingsArr.length) * 10) / 10 : 0;
-      return {
-        id: u.id, full_name: u.full_name, phone: u.phone, email: u.email, role: u.role,
-        kyc_verified: !!u.kyc_verified, status: u.status || 'active',
-        total_orders: orders?.length || 0, total_gmv: totalGmv,
-        avg_rating: avgRating, rating_count: ratingsArr.length,
-        village: isfarmer ? u.location : null,
-        city: !isfarmer ? (u.business_name || u.location) : null,
-        joined_at: u.created_at,
-      };
-    }));
+    const userIds = (users || []).map(u => u.id);
+    let farmerOrders = [], traderOrders = [], allRatings = [];
 
-    res.json({ success: true, data: enriched });
+    if (userIds.length > 0) {
+      const [fO, tO, aR] = await Promise.all([
+        adminSupabase.from('orders').select('id, farmer_id, final_amount, status').in('farmer_id', userIds),
+        adminSupabase.from('orders').select('id, trader_id, final_amount, status').in('trader_id', userIds),
+        adminSupabase.from('order_ratings').select('rating, ratee_id').in('ratee_id', userIds)
+      ]);
+      farmerOrders = fO.data || [];
+      traderOrders = tO.data || [];
+      allRatings = aR.data || [];
+    }
+
+    const enrichedUsers = (users || []).map(u => {
+      const fOrders = farmerOrders.filter(o => o.farmer_id === u.id);
+      const tOrders = traderOrders.filter(o => o.trader_id === u.id);
+      const ratings = allRatings.filter(r => r.ratee_id === u.id);
+
+      const totalF = fOrders.reduce((s, o) => s + (Number(o.final_amount) || 0), 0);
+      const totalT = tOrders.reduce((s, o) => s + (Number(o.final_amount) || 0), 0);
+
+      return {
+        ...u,
+        total_gmv: totalF + totalT,
+        orders_count: fOrders.length + tOrders.length,
+        rating: ratings.length > 0 ? ratings.reduce((s, r) => s + (r.rating || 0), 0) / ratings.length : 0,
+        kyc_verified: !!u.kyc_verified || u.verification_status === 'verified',
+        status: u.status || 'active'
+      };
+    });
+
+    res.json({ success: true, data: enrichedUsers });
   } catch (err) {
+    console.error('Error in /api/admin/users:', err);
     res.status(500).json({ success: false, error: err.message, data: [] });
   }
 });
@@ -346,29 +356,43 @@ router.get('/payouts', authenticateToken, requireAdmin, async (req, res) => {
         id, final_amount, payment_status, created_at, razorpay_payment_id, farmer_id,
         farmer:users!farmer_id(full_name, phone),
         trader:users!trader_id(full_name, phone),
-        listing:crop_listings!listing_id(variety)
-      `)
-      .in('payment_status', ['failed', 'kyc_pending', 'bank_pending', 'processing', 'yet_to_paid', 'not_paid']);
+        listing:crop_listings!listing_id(variety),
+        crop_listings(variety)
+      `);
 
-    if (status !== 'all') query = query.eq('payment_status', status);
+    if (status === 'history') {
+      query = query.eq('payment_status', 'paid');
+    } else if (status !== 'all') {
+      query = query.eq('payment_status', status);
+    } else {
+      query = query.in('payment_status', ['failed', 'kyc_pending', 'bank_pending', 'processing', 'yet_to_paid', 'not_paid']);
+    }
     const { data, error } = await query.order('created_at', { ascending: true }).limit(100);
     if (error) throw error;
 
     const farmerIds = [...new Set((data || []).map(o => o.farmer_id))];
-    const { data: banks } = await adminSupabase.from('bank_accounts').select('user_id, bank_id, account_number').in('user_id', farmerIds);
-    const bankMap = (banks || []).reduce((acc, b) => { acc[b.user_id] = b; return acc; }, {});
+    let banks = [];
+    if (farmerIds.length > 0) {
+      const { data: b, error: bankErr } = await adminSupabase.from('bank_accounts').select('user_id, bank_id, account_number').in('user_id', farmerIds);
+      if (bankErr) throw bankErr;
+      banks = b || [];
+    }
+    const bankMap = banks.reduce((acc, b) => { acc[b.user_id] = b; return acc; }, {});
 
     const result = (data || []).map(o => {
       const bank = bankMap[o.farmer_id];
       return {
-        id: o.id, order_id: o.id,
-        farmer_name: o.farmer?.full_name || 'Unknown', farmer_phone: o.farmer?.phone || '',
-        trader_name: o.trader?.full_name || 'System', trader_phone: o.trader?.phone || '',
-        crop_name: o.listing?.variety || 'Unknown Crop',
-        final_amount: o.final_amount || 0,
-        payout_amount: Math.round((o.final_amount || 0) * 0.97 * 100) / 100,
-        status: o.payment_status, razorpay_payment_id: o.razorpay_payment_id || null,
-        bank_name: bank?.bank_id || null, account_number: bank?.account_number || null,
+        id: o.id, 
+        order_id: o.id,
+        payment_status: o.payment_status,
+        final_amount: o.final_amount,
+        farmer_name: o.farmer?.full_name || 'Unknown', 
+        farmer_phone: o.farmer?.phone || '',
+        trader_name: o.trader?.full_name || 'System', 
+        trader_phone: o.trader?.phone || '',
+        crop_name: o.listing?.variety || o.crop_listings?.variety || 'Unknown Crop',
+        bank_details: bank ? `${bank.bank_id} - ${bank.account_number}` : 'No bank linked',
+        razorpay_payment_id: o.razorpay_payment_id || null,
         created_at: o.created_at,
       };
     });
@@ -398,6 +422,43 @@ router.post('/payouts/:orderId/pay', authenticateToken, requireAdmin, async (req
     if (updateErr) throw updateErr;
     console.log(`💰 [ADMIN] Manual payout triggered for order ${orderId} by admin ${req.user.id}`);
     res.json({ success: true, message: 'Payout marked as successful' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/admin/verifications
+ */
+router.get('/verifications', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await adminSupabase
+      .from('users')
+      .select('id, full_name, role, phone, email, business_name, document_url, updated_at')
+      .eq('verification_status', 'pending_verification')
+      .order('updated_at', { ascending: true });
+
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * PUT /api/admin/verify/:userId
+ */
+router.put('/verify/:userId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { status } = req.body;
+    const { error } = await adminSupabase
+      .from('users')
+      .update({ verification_status: status, updated_at: new Date() })
+      .eq('id', userId);
+
+    if (error) throw error;
+    res.json({ success: true, message: `User status updated to ${status}` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

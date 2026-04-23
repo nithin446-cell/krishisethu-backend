@@ -28,8 +28,10 @@ const s3Client = new S3Client({
  */
 router.get('/:id', authenticateToken, async (req, res) => {
   try {
-    // Step 1: Fetch the order row + crop/bid info (no user joins to avoid Supabase double-alias bug)
-    const { data, error } = await req.userSupabase
+    // Step 1: Fetch the order row + crop/bid info using adminSupabase to bypass RLS issues
+    // while we manually verify ownership below. This avoids the "Cannot coerce result" error
+    // when RLS policies are too restrictive for finished orders.
+    const { data, error } = await adminSupabase
       .from('orders')
       .select(`
         *,
@@ -41,7 +43,16 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
     if (error || !data) throw new Error(error?.message || 'Order not found');
 
-    // Step 2: Fetch farmer and trader separately to guarantee correct user data
+    // Step 2: Manual Security Check
+    const isFarmer = req.user.id === data.farmer_id;
+    const isTrader = req.user.id === data.trader_id;
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isFarmer && !isTrader && !isAdmin) {
+      return res.status(403).json({ success: false, error: 'Unauthorized to view this order' });
+    }
+
+    // Step 3: Fetch farmer and trader separately to guarantee correct user data
     const [farmerResult, traderResult] = await Promise.all([
       adminSupabase.from('users').select('full_name, phone, location').eq('id', data.farmer_id).single(),
       adminSupabase.from('users').select('full_name, phone, location, business_name').eq('id', data.trader_id).single()
@@ -93,30 +104,26 @@ router.put('/:id/status', authenticateToken, async (req, res) => {
     const isTrader = req.user.id === order.trader_id;
     if (!isFarmer && !isTrader) return res.status(403).json({ error: 'Unauthorized to update this order' });
 
-    // 1. Build history event
-    const newEvent = {
-       status,
-       timestamp: new Date().toISOString(),
-       actor: isFarmer ? 'Farmer' : 'Trader',
-       note: dispatch_note || (status === 'confirmed' ? 'Order accepted by farmer' : `Status updated to ${status}`)
-    };
+    // 1. Use RPC for Atomic History Append and Status Update
+    const { error: rpcErr } = await adminSupabase.rpc('append_order_history', {
+      p_order_id: orderId,
+      p_status: status,
+      p_note: dispatch_note || (status === 'confirmed' ? 'Order accepted by farmer' : `Status updated to ${status}`),
+      p_actor: isFarmer ? 'Farmer' : 'Trader'
+    });
 
-    const updateData = {
-      status,
-      status_history: [...(order.status_history || []), newEvent],
-      updated_at: new Date()
-    };
+    if (rpcErr) throw rpcErr;
 
+    // 2. Additional metadata updates for specific statuses (dispatch details)
     if (status === 'dispatched') {
-      updateData.dispatched_at = new Date();
-      updateData.vehicle_number = vehicle_number;
-      updateData.estimated_days = parseInt(estimated_days);
+      await adminSupabase.from('orders').update({
+        dispatched_at: new Date(),
+        vehicle_number,
+        estimated_days: parseInt(estimated_days)
+      }).eq('id', orderId);
     } else if (status === 'confirmed') {
-      updateData.confirmed_at = new Date();
+      await adminSupabase.from('orders').update({ confirmed_at: new Date() }).eq('id', orderId);
     }
-
-    const { error: updateErr } = await adminSupabase.from('orders').update(updateData).eq('id', orderId);
-    if (updateErr) throw updateErr;
 
     // 2. Notifications
     const recipientPhone = isFarmer ? order.trader?.phone : order.farmer?.phone;
@@ -171,22 +178,23 @@ router.put('/:id/deliver', authenticateToken, upload.single('delivery_photo'), a
       fs.unlinkSync(req.file.path);
     }
 
-    const newEvent = {
-      status: 'delivered',
-      timestamp: new Date().toISOString(),
-      actor: 'Trader',
-      note: delivery_note || 'Trader confirmed delivery of goods'
-    };
-
+    // 1. Update delivery details
     await adminSupabase.from('orders').update({
-      status: 'delivered',
       payment_status: 'processing',
       delivered_at: new Date(),
       delivery_photo_url: photoUrl,
       delivery_note: delivery_note || null,
-      status_history: [...(order.status_history || []), newEvent],
-      updated_at: new Date()
     }).eq('id', orderId);
+
+    // 2. Atomic History Append
+    const { error: rpcErr } = await adminSupabase.rpc('append_order_history', {
+      p_order_id: orderId,
+      p_status: 'delivered',
+      p_note: delivery_note || 'Trader confirmed delivery of goods',
+      p_actor: 'Trader'
+    });
+
+    if (rpcErr) throw rpcErr;
 
     if (order.farmer?.phone) {
       await sendSMS(order.farmer.phone, `KrishiSethu: Saman mil gaya! Trader ne delivery confirm kar di hai. Payment release ho raha hai.`);
@@ -236,24 +244,26 @@ router.post('/:id/rating', authenticateToken, async (req, res) => {
 
     if (fetchErr || !order) throw new Error('Order not found');
 
-    const newEvent = {
-      status: 'rated',
-      timestamp: new Date().toISOString(),
-      actor: 'System',
-      note: `User rated this transaction ${rating} stars: ${note || 'No comment'}`
-    };
-
+    // 1. Submit Rating
     const { error: updateErr } = await adminSupabase
       .from('orders')
       .update({
         rating: rating,
-        rating_note: note,
-        status_history: [...(order.status_history || []), newEvent],
-        updated_at: new Date()
+        rating_note: note
       })
       .eq('id', orderId);
 
     if (updateErr) throw updateErr;
+
+    // 2. Atomic History Append
+    const { error: rpcErr } = await adminSupabase.rpc('append_order_history', {
+      p_order_id: orderId,
+      p_status: 'rated',
+      p_note: `User rated this transaction ${rating} stars: ${note || 'No comment'}`,
+      p_actor: 'System'
+    });
+
+    if (rpcErr) throw rpcErr;
 
     res.json({ success: true, message: 'Rating submitted successfully!' });
   } catch (err) {

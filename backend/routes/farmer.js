@@ -120,6 +120,29 @@ router.get('/orders', authenticateToken, async (req, res) => {
 });
 
 /**
+ * GET /api/farmer/bids
+ * Get all bids received on any listing posted by the farmer.
+ */
+router.get('/bids', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await req.userSupabase
+      .from('bids')
+      .select(`
+        *,
+        crop_listings!inner(farmer_id, variety),
+        trader:users!trader_id(full_name, location)
+      `)
+      .eq('crop_listings.farmer_id', req.user.id)
+      .order('created_at', { ascending: false });
+      
+    if (error) throw error;
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * POST /api/farmer/kyc
  * Submit manual KYC documents for verification.
  */

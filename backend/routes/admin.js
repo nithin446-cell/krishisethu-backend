@@ -111,39 +111,25 @@ router.get('/orders', authenticateToken, requireAdmin, async (req, res) => {
 router.get('/kyc', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const status = req.query.status || 'pending';
-    const { data, error } = await adminSupabase
+    
+    // 1. Fetch new KYC records (primarily Farmers using the modern flow)
+    const { data: farmerKyc, error: kycErr } = await adminSupabase
       .from('farmer_kyc')
       .select(`
         id, user_id, pan_number, pan_name, pan_dob,
         aadhaar_last4, aadhaar_name, aadhaar_address,
         selfie_path, aadhaar_doc_path, face_match_score,
         status, submitted_at, rejection_reason,
-        user:users!user_id(full_name, phone, email)
+        user:users!user_id(full_name, phone, email, role)
       `)
       .eq('status', status)
       .order('submitted_at', { ascending: true })
       .limit(100);
 
-    if (error) throw error;
-
-    // Fetch legacy users
-    let legacyRecords = [];
-    const legacyStatusMap = { pending: 'pending_verification', approved: 'verified', rejected: 'rejected' };
-    const legacyStatus = legacyStatusMap[status];
-    if (legacyStatus) {
-      const { data: legacy } = await adminSupabase
-        .from('users')
-        .select('id, full_name, phone, email, document_url, updated_at')
-        .eq('verification_status', legacyStatus);
-      legacyRecords = (legacy || []).map(u => ({
-        id: `legacy-${u.id}`, user_id: u.id, status,
-        submitted_at: u.updated_at, user_name: u.full_name,
-        user_phone: u.phone, user_email: u.email, selfie_url: u.document_url,
-      }));
-    }
+    if (kycErr) throw kycErr;
 
     // Generate signed URLs for new KYC records
-    const newRecords = await Promise.all((data || []).map(async k => {
+    const newRecords = await Promise.all((farmerKyc || []).map(async k => {
       let selfieUrl = null, docUrl = null;
       if (k.selfie_path) {
         const { data: u } = await adminSupabase.storage.from('kyc-documents').createSignedUrl(k.selfie_path, 3600);
@@ -158,12 +144,51 @@ router.get('/kyc', authenticateToken, requireAdmin, async (req, res) => {
         user_name: k.user?.full_name,
         user_phone: k.user?.phone,
         user_email: k.user?.email,
+        role: k.user?.role || 'farmer',
         selfie_url: selfieUrl,
         aadhaar_doc_url: docUrl,
+        is_legacy: false
       };
     }));
 
-    res.json({ success: true, data: [...legacyRecords, ...newRecords] });
+    // 2. Fetch legacy KYC records (those who uploaded via manual kyc.js flow)
+    let legacyRecords = [];
+    const legacyStatusMap = { pending: 'pending_verification', approved: 'verified', rejected: 'rejected' };
+    const legacyStatus = legacyStatusMap[status];
+
+    if (legacyStatus) {
+      const { data: users, error: userErr } = await adminSupabase
+        .from('users')
+        .select('id, full_name, phone, email, document_url, document_type, updated_at, role')
+        .eq('verification_status', legacyStatus);
+      
+      if (userErr) {
+        console.error('[ADMIN_KYC] Legacy fetch error:', userErr);
+      }
+
+      legacyRecords = (users || []).map(u => ({
+        id: `legacy-${u.id}`,
+        user_id: u.id,
+        status,
+        submitted_at: u.updated_at,
+        user_name: u.full_name,
+        user_phone: u.phone,
+        user_email: u.email,
+        role: u.role,
+        document_type: u.document_type,
+        // Map document_url to both selfie and aadhaar if only one exists
+        selfie_url: u.document_url, 
+        aadhaar_doc_url: u.document_url,
+        is_legacy: true,
+        pan_number: 'MANUAL',
+        aadhaar_last4: 'MANUAL'
+      }));
+    }
+
+    const allRecords = [...legacyRecords, ...newRecords];
+    console.log(`[ADMIN_KYC] Returning ${allRecords.length} records (${legacyRecords.length} legacy, ${newRecords.length} new)`);
+    
+    res.json({ success: true, data: allRecords });
   } catch (err) {
     console.error('[ADMIN_KYC_ERROR]', err.message);
     res.status(500).json({ success: false, error: err.message, data: [] });

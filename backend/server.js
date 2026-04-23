@@ -2,6 +2,7 @@ const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development') });
 require('dotenv').config({ path: path.join(__dirname, '.env') }); // Fallback to .env
 
+// KrishiSethu Backend Server
 const express = require('express');
 const expressWs = require('express-ws');
 const cors = require('cors');
@@ -36,6 +37,7 @@ app.use(globalLimiter);
 
 // --- Modular Routes ---
 app.use('/api/auth', authLimiter, require('./routes/auth'));
+app.use('/api/user/kyc', require('./routes/kyc')); // Handle KYC separately
 app.use('/api/user', require('./routes/auth')); // Reusing for profile routes
 app.use('/api/market', require('./routes/market'));
 app.use('/api/farmer', require('./routes/farmer'));
@@ -46,6 +48,8 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/bank', require('./routes/bank'));
 app.use('/api/mandi', require('./routes/mandi'));
 app.use('/api/chat', require('./routes/chat'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/kyc', require('./routes/kyc'));
 
 // --- NEW: Public/Shared Data Routes ---
 app.get('/api/schemes', authenticateToken, async (req, res) => {
@@ -79,16 +83,17 @@ app.ws('/ws', (ws, req) => {
     if (!isAuthorized) ws.close(1008, 'Authentication timeout');
   }, 5000);
 
-  ws.on('message', async (msg) => {
+    ws.on('message', async (msg) => {
     try {
       const parsed = JSON.parse(msg);
 
       // 1. Initial Handshake
       if (parsed.type === 'AUTH') {
-        const { token, order_id, user_id } = parsed;
+        const { token, order_id: msgOrderId, user_id: msgUserId } = parsed;
         const { data, error } = await adminSupabase.auth.getUser(token);
         
         if (error || !data.user) {
+          console.error('[WS_AUTH] Unauthorized:', error?.message);
           return ws.close(1008, 'Unauthorized: Invalid token');
         }
 
@@ -96,23 +101,29 @@ app.ws('/ws', (ws, req) => {
         isAuthorized = true;
         clearTimeout(authTimeout);
 
+        // Capture IDs from message (preferred) or query
+        const finalOrderId = msgOrderId || req.query.order_id;
+        const finalUserId = msgUserId || req.query.user_id;
+
         // CASE A: Join Chat Room
-        if (order_id) {
-          if (!chatRooms[order_id]) chatRooms[order_id] = new Set();
-          chatRooms[order_id].add(ws);
+        if (finalOrderId) {
+          if (!chatRooms[finalOrderId]) chatRooms[finalOrderId] = new Set();
+          chatRooms[finalOrderId].add(ws);
           
           ws.on('close', () => {
-            chatRooms[order_id]?.delete(ws);
-            if (chatRooms[order_id]?.size === 0) delete chatRooms[order_id];
+            chatRooms[finalOrderId]?.delete(ws);
+            if (chatRooms[finalOrderId]?.size === 0) delete chatRooms[finalOrderId];
           });
           
-          ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', message: `Joined room ${order_id}` }));
+          ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', message: `Joined room ${finalOrderId}` }));
+          console.log(`[WS] User ${authenticatedUserId} joined room ${finalOrderId}`);
         } 
         // CASE B: Notification Stream
-        else if (user_id === authenticatedUserId) {
+        else if (finalUserId === authenticatedUserId) {
           globalConnections.set(authenticatedUserId, ws);
           ws.on('close', () => globalConnections.delete(authenticatedUserId));
           ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', message: 'Notifications active' }));
+          console.log(`[WS] User ${authenticatedUserId} connected for notifications`);
         } else {
           ws.close(1008, 'Forbidden: ID mismatch');
         }
@@ -157,7 +168,18 @@ app.use((err, req, res, next) => {
 });
 
 const port = process.env.PORT || 10000;
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`🚀 KrishiSethu Backend Running on port ${port} [${process.env.NODE_ENV}]`);
+});
+
+// Handle server errors (like port already in use)
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\n❌ ERROR: Port ${port} is already in use!`);
+    console.error(`💡 FIX: Run 'taskkill /F /IM node.exe' in your terminal and then run 'npm run dev' again.\n`);
+    process.exit(1);
+  } else {
+    console.error('Server error:', err);
+  }
 });
  

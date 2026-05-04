@@ -5,7 +5,7 @@ const path = require('path');
 const multer = require('multer');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { supabase: adminSupabase, BUCKETS } = require('../config/supabase');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireFarmer } = require('../middleware/auth');
 const { sendPushNotification, sendSMS } = require('../utils/notifications');
 
 // Multer and S3 setup for Farmer uploads
@@ -27,7 +27,7 @@ const s3Client = new S3Client({
  * POST /api/farmer/upload
  * Farmer uploads produce details and up to 5 images.
  */
-router.post('/upload', authenticateToken, upload.array('images', 5), async (req, res) => {
+router.post('/upload', authenticateToken, requireFarmer, upload.array('images', 5), async (req, res) => {
   try {
     const { crop_name, variety, quantity, unit, base_price, location, description, status } = req.body;
     const farmer_id = req.user.id;
@@ -84,17 +84,28 @@ router.post('/upload', authenticateToken, upload.array('images', 5), async (req,
  * GET /api/farmer/listings
  * Get all listings posted by the current farmer.
  */
-router.get('/listings', authenticateToken, async (req, res) => {
+router.get('/listings', authenticateToken, requireFarmer, async (req, res) => {
   try {
-    const { data, error } = await req.userSupabase
+    const { data, error } = await adminSupabase
       .from('crop_listings')
-      .select(`*, bids ( id, trader_id, amount, quantity, status, created_at, users (full_name) )`)
+      .select(`
+        *,
+        bids (
+          id, 
+          trader_id, 
+          amount, 
+          quantity, 
+          status, 
+          created_at, 
+          trader:users!trader_id (full_name)
+        )
+      `)
       .eq('farmer_id', req.user.id)
       .in('status', ['active', 'sold'])
       .order('created_at', { ascending: false });
       
     if (error) throw error;
-    res.status(200).json({ success: true, data });
+    res.status(200).json(data || []);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -104,16 +115,20 @@ router.get('/listings', authenticateToken, async (req, res) => {
  * GET /api/farmer/orders
  * Get tracking data for all orders accepted by the farmer.
  */
-router.get('/orders', authenticateToken, async (req, res) => {
+router.get('/orders', authenticateToken, requireFarmer, async (req, res) => {
   try {
-    const { data, error } = await req.userSupabase
+    const { data, error } = await adminSupabase
       .from('orders')
-      .select(`*, crop_listings (variety, unit), trader:users!trader_id (business_name, full_name, phone, location)`)
+      .select(`
+        *, 
+        crop_listings!listing_id (variety, unit, location), 
+        trader:users!trader_id (business_name, full_name, phone, location)
+      `)
       .eq('farmer_id', req.user.id)
       .order('created_at', { ascending: false });
       
     if (error) throw error;
-    res.status(200).json({ success: true, data });
+    res.status(200).json(data || []);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -123,9 +138,9 @@ router.get('/orders', authenticateToken, async (req, res) => {
  * GET /api/farmer/bids
  * Get all bids received on any listing posted by the farmer.
  */
-router.get('/bids', authenticateToken, async (req, res) => {
+router.get('/bids', authenticateToken, requireFarmer, async (req, res) => {
   try {
-    const { data, error } = await req.userSupabase
+    const { data, error } = await adminSupabase
       .from('bids')
       .select(`
         *,
@@ -136,7 +151,7 @@ router.get('/bids', authenticateToken, async (req, res) => {
       .order('created_at', { ascending: false });
       
     if (error) throw error;
-    res.status(200).json({ success: true, data });
+    res.status(200).json(data || []);
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -146,7 +161,7 @@ router.get('/bids', authenticateToken, async (req, res) => {
  * POST /api/farmer/kyc
  * Submit manual KYC documents for verification.
  */
-router.post('/kyc', authenticateToken, upload.array('documents', 5), async (req, res) => {
+router.post('/kyc', authenticateToken, requireFarmer, upload.array('documents', 5), async (req, res) => {
   try {
     const { document_type } = req.body;
     const userId = req.user.id;
@@ -179,7 +194,7 @@ router.post('/kyc', authenticateToken, upload.array('documents', 5), async (req,
  * PUT /api/farmer/bid/:bidId/accept
  * Farmer accepts a bid, creating an order and notifying the trader.
  */
-router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
+router.put('/bid/:bidId/accept', authenticateToken, requireFarmer, async (req, res) => {
   try {
     const { bidId } = req.params;
     const { listing_id } = req.body;
@@ -312,7 +327,7 @@ router.put('/bid/:bidId/accept', authenticateToken, async (req, res) => {
  * PUT /api/farmer/order/:orderId/confirm-payment
  * Farmer confirms or disputes payment receipt.
  */
-router.put('/order/:orderId/confirm-payment', authenticateToken, async (req, res) => {
+router.put('/order/:orderId/confirm-payment', authenticateToken, requireFarmer, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { payment_status } = req.body; // 'paid' or 'not_paid'

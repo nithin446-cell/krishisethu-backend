@@ -8,13 +8,19 @@ const { sendPushNotification } = require('../notificationHelper');
  */
 const sendSMS = async (phones, message) => {
   const apiKey = process.env.FAST2SMS_API_KEY;
+  const numbers = Array.isArray(phones) ? phones.join(',') : phones;
+  if (!numbers) return;
+
+  // Mock SMS in development to avoid 401 errors if API key is invalid/expired
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`[SMS_MOCK] Would send to ${numbers}: "${message}"`);
+    return;
+  }
+
   if (!apiKey) {
     console.warn('[SMS] FAST2SMS_API_KEY not set — skipping SMS.');
     return;
   }
-
-  const numbers = Array.isArray(phones) ? phones.join(',') : phones;
-  if (!numbers) return;
 
   try {
     const res = await axios.post(
@@ -28,7 +34,12 @@ const sendSMS = async (phones, message) => {
       console.log(`[SMS] Sent to ${numbers}`);
     }
   } catch (err) {
-    console.error('[SMS] Failed to send:', err.message);
+    // If it's a 401, it's an API key issue. Let's make the error clearer.
+    if (err.response?.status === 401) {
+      console.error('[SMS] Failed to send: Invalid Fast2SMS API Key (401 Unauthorized).');
+    } else {
+      console.error('[SMS] Failed to send:', err.message);
+    }
   }
 };
 

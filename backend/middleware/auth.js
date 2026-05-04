@@ -52,4 +52,44 @@ const requireAdmin = async (req, res, next) => {
   }
 };
 
-module.exports = { authenticateToken, requireAdmin };
+/**
+ * Restricts access to users with the 'farmer' role.
+ */
+const requireFarmer = async (req, res, next) => {
+  try {
+    const { data: user, error } = await adminSupabase
+      .from('users')
+      .select('role')
+      .eq('id', req.user.id)
+      .single();
+
+    if (error || user?.role !== 'farmer') {
+      return res.status(403).json({ success: false, error: 'Forbidden: Farmer access required' });
+    }
+    next();
+  } catch (err) {
+    res.status(403).json({ success: false, error: 'Access denied' });
+  }
+};
+
+/**
+ * Restricts access to users with the 'trader' role.
+ */
+const requireTrader = async (req, res, next) => {
+  try {
+    const { data: user, error } = await adminSupabase
+      .from('users')
+      .select('role')
+      .eq('id', req.user.id)
+      .single();
+
+    if (error || user?.role !== 'trader') {
+      return res.status(403).json({ success: false, error: 'Forbidden: Trader access required' });
+    }
+    next();
+  } catch (err) {
+    res.status(403).json({ success: false, error: 'Access denied' });
+  }
+};
+
+module.exports = { authenticateToken, requireAdmin, requireFarmer, requireTrader };

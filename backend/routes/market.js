@@ -9,9 +9,9 @@ const { authenticateToken } = require('../middleware/auth');
  */
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const { data, error } = await req.userSupabase
+    const { data, error } = await adminSupabase
       .from('crop_listings')
-      .select(`*, users ( full_name, location, business_name ), crop_pictures ( image_url ), bids ( * )`)
+      .select(`*, farmer:users!farmer_id ( full_name, location, business_name ), crop_pictures ( image_url ), bids ( * )`)
       .eq('status', 'active')
       .order('created_at', { ascending: false });
       

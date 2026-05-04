@@ -1,14 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const { supabase: adminSupabase } = require('../config/supabase');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireTrader } = require('../middleware/auth');
 const { sendPushNotification, sendSMS } = require('../utils/notifications');
 
 /**
  * POST /api/trader/bid
  * Trader places a new bid on a listing.
  */
-router.post('/bid', authenticateToken, async (req, res) => {
+router.post('/bid', authenticateToken, requireTrader, async (req, res) => {
   try {
     const { listing_id, amount, quantity, message } = req.body;
     const { data: bid, error: bidErr } = await req.userSupabase
@@ -56,16 +56,19 @@ router.post('/bid', authenticateToken, async (req, res) => {
  * GET /api/trader/bids
  * Get all bids placed by the current trader.
  */
-router.get('/bids', authenticateToken, async (req, res) => {
+router.get('/bids', authenticateToken, requireTrader, async (req, res) => {
   try {
     const { data, error } = await adminSupabase
       .from('bids')
-      .select(`*, crop_listings (variety, current_price, status)`)
+      .select(`
+        *,
+        crop_listings:listing_id (variety, current_price, status)
+      `)
       .eq('trader_id', req.user.id)
       .order('created_at', { ascending: false });
       
     if (error) throw error;
-    res.status(200).json({ success: true, data });
+    res.status(200).json(data || []);
   } catch (error) {
     console.error('[TRADER_BIDS_ERROR]', error.message);
     res.status(500).json({ success: false, error: error.message });
@@ -76,23 +79,28 @@ router.get('/bids', authenticateToken, async (req, res) => {
  * GET /api/trader/orders
  * Get active orders that the trader needs to pay or track.
  */
-router.get('/orders', authenticateToken, async (req, res) => {
+router.get('/orders', authenticateToken, requireTrader, async (req, res) => {
   try {
+    console.log('[TRADER_ORDERS_FETCH] User:', req.user.id);
     const { data, error } = await adminSupabase
       .from('orders')
       .select(`
         *,
-        crop_listings (variety, unit, location),
+        crop_listings!listing_id (variety, unit, location),
         farmer:users!farmer_id (full_name, phone),
-        bids (quantity)
+        bids!bid_id (quantity)
       `)
       .eq('trader_id', req.user.id)
       .order('created_at', { ascending: false });
       
-    if (error) throw error;
-    res.status(200).json({ success: true, data });
+    if (error) {
+      console.error('[TRADER_ORDERS_ERROR] DB Error:', error);
+      throw error;
+    }
+    console.log('[TRADER_ORDERS_FETCH] Found count:', data?.length || 0);
+    res.status(200).json(data || []);
   } catch (error) {
-    console.error('[TRADER_ORDERS_ERROR]', error.message);
+    console.error('[TRADER_ORDERS_ERROR] Exception:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });

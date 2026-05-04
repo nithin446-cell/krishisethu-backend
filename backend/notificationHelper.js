@@ -40,7 +40,8 @@ const sendPushNotification = async (userId, payload) => {
       .single();
 
     if (error || !user?.fcm_token) {
-      console.log(`[FCM] No token for user ${userId} — skipping`);
+      // It's normal for users to not have an FCM token (e.g., denied permissions or not setup yet)
+      // console.log(`[FCM] No token for user ${userId} — skipping`);
       return;
     }
 
